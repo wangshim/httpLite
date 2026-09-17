@@ -6,15 +6,19 @@ HttpLite —— 轻量级 HTTP 接口测试工具（类 Postman）
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 import sys
 import time
-from datetime import datetime
-from urllib.parse import parse_qsl
+from datetime import datetime, timezone
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import requests
+from requests.auth import HTTPDigestAuth
 
 try:
     import urllib3
@@ -46,6 +50,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -137,6 +142,8 @@ def default_state() -> dict:
                             "body_type": "none",
                             "body_json": "",
                             "body_form": [],
+                            "body_urlenc": [],
+                            "auth": default_auth(),
                         },
                     },
                     {
@@ -148,9 +155,11 @@ def default_state() -> dict:
                             "url": "{{base_url}}/post",
                             "params": [],
                             "headers": [{"key": "Content-Type", "value": "application/json", "enabled": True}],
-                            "body_type": "json",
+                            "body_type": "JSON",
                             "body_json": '{\n    "name": "HttpLite",\n    "token": "{{token}}"\n}',
                             "body_form": [],
+                            "body_urlenc": [],
+                            "auth": bearer_auth("{{token}}"),
                         },
                     },
                 ],
@@ -241,6 +250,341 @@ def pretty_json(text: str):
     except Exception:
         return None
     return json.dumps(obj, ensure_ascii=False, indent=4)
+
+
+# --------------------------------------------------------------------------
+# 认证（Authorization）内核
+# --------------------------------------------------------------------------
+AUTH_TYPE_LABELS = [
+    "无认证",
+    "Bearer Token",
+    "Basic Auth",
+    "Digest Auth",
+    "API Key",
+    "AWS Signature v4",
+    "JWT",
+]
+AUTH_TYPE_KEYS = ["noauth", "bearer", "basic", "digest", "apikey", "awsv4", "jwt"]
+JWT_ALGORITHMS = ["HS256", "HS384", "HS512", "none"]
+
+
+def default_auth() -> dict:
+    return {
+        "type": "noauth",
+        "bearer": {"token": "{{token}}"},
+        "basic": {"username": "", "password": ""},
+        "digest": {"username": "", "password": ""},
+        "apikey": {"key": "X-API-Key", "value": "", "in": "header"},
+        "awsv4": {
+            "access_key": "",
+            "secret_key": "",
+            "session_token": "",
+            "region": "us-east-1",
+            "service": "execute-api",
+        },
+        "jwt": {
+            "algorithm": "HS256",
+            "secret": "",
+            "payload": '{\n    "sub": "1234567890",\n    "name": "HttpLite",\n    "iat": 0\n}',
+            "location": "header",
+            "header_name": "Authorization",
+            "prefix": "Bearer ",
+        },
+    }
+
+
+def bearer_auth(token: str) -> dict:
+    cfg = default_auth()
+    cfg["type"] = "bearer"
+    cfg["bearer"]["token"] = token
+    return cfg
+
+
+def merge_auth(data) -> dict:
+    """把（可能缺失字段的）认证配置补齐成完整结构。"""
+    base = default_auth()
+    if isinstance(data, dict):
+        if data.get("type") in AUTH_TYPE_KEYS:
+            base["type"] = data["type"]
+        for key, value in data.items():
+            if isinstance(value, dict) and isinstance(base.get(key), dict):
+                base[key].update(value)
+    return base
+
+
+def auth_label(atype: str) -> str:
+    if atype in AUTH_TYPE_KEYS:
+        return AUTH_TYPE_LABELS[AUTH_TYPE_KEYS.index(atype)]
+    return "无认证"
+
+
+def auth_tag_of(request) -> str:
+    """取请求快照里的认证方式标签（无认证返回空串）。"""
+    if not isinstance(request, dict):
+        return ""
+    cfg = request.get("auth")
+    atype = cfg.get("type") if isinstance(cfg, dict) else None
+    if atype and atype != "noauth":
+        return auth_label(atype)
+    return ""
+
+
+def mask_secret(text: str, keep: int = 6) -> str:
+    if not text:
+        return "(空)"
+    if len(text) <= keep + 4:
+        return "*" * 8
+    return text[:keep] + "…" + "*" * 4
+
+
+def set_header(headers: dict, key: str, value: str) -> None:
+    """大小写不敏感地写入/覆盖一个请求头。"""
+    for k in list(headers):
+        if k.lower() == key.lower():
+            del headers[k]
+    headers[key] = value
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def make_jwt(algorithm: str, secret: str, payload_text: str):
+    """本地生成 JWT（HS256 / HS384 / HS512 / none）。返回 (token, error)。"""
+    alg = (algorithm or "HS256").strip()
+    text = (payload_text or "").strip()
+    try:
+        payload = json.loads(text) if text else {}
+    except Exception as e:  # noqa: BLE001
+        return None, f"Payload 不是合法 JSON（{e}）"
+    if not isinstance(payload, dict):
+        return None, "Payload 必须是 JSON 对象"
+    header = {"alg": alg, "typ": "JWT"}
+    signing_input = ".".join(
+        [
+            b64url(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
+            b64url(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")),
+        ]
+    )
+    if alg == "none":
+        return signing_input + ".", None
+    digest = {
+        "HS256": hashlib.sha256,
+        "HS384": hashlib.sha384,
+        "HS512": hashlib.sha512,
+    }.get(alg)
+    if digest is None:
+        return None, f"不支持的算法：{alg}"
+    if not secret:
+        return None, "未填写 JWT 密钥（Secret）"
+    signature = hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), digest).digest()
+    return signing_input + "." + b64url(signature), None
+
+
+def request_body_bytes(payload: dict) -> bytes:
+    """还原 requests 实际会发送的请求体字节，用于签名计算。"""
+    if payload.get("files") is not None:
+        return b""
+    data = payload.get("data")
+    if data is not None:
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        if isinstance(data, dict):
+            return urlencode(data, doseq=True).encode("utf-8")
+    if payload.get("json") is not None:
+        # 与 requests 内部 json= 的序列化方式保持一致
+        return json.dumps(payload["json"], allow_nan=False).encode("utf-8")
+    return b""
+
+
+def _canonical_query(pairs) -> str:
+    encoded = []
+    for k, v in pairs:
+        if k is None:
+            continue
+        encoded.append(
+            (quote(str(k), safe="-_.~"), quote("" if v is None else str(v), safe="-_.~"))
+        )
+    encoded.sort()
+    return "&".join(f"{k}={v}" for k, v in encoded)
+
+
+def aws_sign_v4(payload: dict, cfg: dict, variables: dict, amz_date: str = None):
+    """AWS Signature Version 4 签名。返回 (需要追加的请求头 dict, 错误信息)。"""
+    access = substitute(cfg.get("access_key", ""), variables).strip()
+    secret = substitute(cfg.get("secret_key", ""), variables).strip()
+    session = substitute(cfg.get("session_token", ""), variables).strip()
+    region = substitute(cfg.get("region", ""), variables).strip() or "us-east-1"
+    service = substitute(cfg.get("service", ""), variables).strip() or "execute-api"
+    if not access or not secret:
+        return None, "需要填写 Access Key 与 Secret Key"
+
+    parts = urlsplit(payload.get("url") or "")
+    host = parts.netloc
+    if not host:
+        return None, "URL 缺少主机名"
+    path = parts.path or "/"
+
+    body = request_body_bytes(payload)
+    payload_hash = hashlib.sha256(body).hexdigest()
+
+    amz_date = amz_date or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    short_date = amz_date[:8]
+
+    pairs = list(parse_qsl(parts.query, keep_blank_values=True))
+    pairs += list(payload.get("params") or [])
+    canonical_query = _canonical_query(pairs)
+
+    if service == "s3":
+        canonical_uri = quote(path, safe="/~")
+    else:
+        canonical_uri = quote(quote(path, safe="/~"), safe="/~")
+
+    canon = {"host": host}
+    for k, v in (payload.get("headers") or {}).items():
+        low = str(k).lower()
+        if low in (
+            "authorization",
+            "host",
+            "x-amz-date",
+            "x-amz-content-sha256",
+            "x-amz-security-token",
+        ):
+            continue
+        canon[low] = re.sub(r"\s+", " ", str(v)).strip()
+    canon["x-amz-date"] = amz_date
+    if service == "s3":
+        canon["x-amz-content-sha256"] = payload_hash
+    if session:
+        canon["x-amz-security-token"] = session
+
+    signed_headers = ";".join(sorted(canon))
+    canonical_headers = "".join(f"{k}:{canon[k]}\n" for k in sorted(canon))
+    canonical_request = "\n".join(
+        [
+            (payload.get("method") or "GET").upper(),
+            canonical_uri,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+
+    scope = f"{short_date}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_signing = _h(
+        _h(_h(_h(("AWS4" + secret).encode("utf-8"), short_date), region), service), "aws4_request"
+    )
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    out = {
+        "X-Amz-Date": amz_date,
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    }
+    if service == "s3":
+        out["X-Amz-Content-Sha256"] = payload_hash
+    if session:
+        out["X-Amz-Security-Token"] = session
+    return out, None
+
+
+def apply_auth(payload: dict, auth: dict, variables: dict) -> list:
+    """把认证配置真正写入请求（headers / params / requests_auth），返回说明列表。"""
+    notes = []
+    auth = merge_auth(auth)
+    atype = auth["type"]
+    if atype == "noauth":
+        return notes
+
+    headers = payload.get("headers")
+    if headers is None:
+        headers = {}
+        payload["headers"] = headers
+    params = list(payload.get("params") or [])
+
+    if atype == "bearer":
+        token = substitute(auth["bearer"].get("token", ""), variables).strip()
+        if token:
+            set_header(headers, "Authorization", "Bearer " + token)
+            notes.append("Authorization: Bearer " + mask_secret(token, 8))
+        else:
+            notes.append("Bearer Token 为空，未添加认证信息")
+    elif atype in ("basic", "digest"):
+        cfg = auth[atype]
+        user = substitute(cfg.get("username", ""), variables)
+        pwd = substitute(cfg.get("password", ""), variables)
+        if not user and not pwd:
+            notes.append("未填写用户名 / 密码，未添加认证信息")
+        elif atype == "basic":
+            payload["requests_auth"] = (user, pwd)
+            notes.append(f"Basic Auth：{user}（由 requests 生成 Authorization 头）")
+        else:
+            payload["requests_auth"] = HTTPDigestAuth(user, pwd)
+            notes.append(f"Digest Auth：{user}（先请求 401 挑战再重发）")
+    elif atype == "apikey":
+        cfg = auth["apikey"]
+        key = substitute(cfg.get("key", ""), variables).strip()
+        value = substitute(cfg.get("value", ""), variables)
+        if not key:
+            notes.append("API Key 名称为空，未添加认证信息")
+        elif (cfg.get("in") or "header") == "query":
+            params.append((key, value))
+            notes.append(f"Query 参数 {key}={mask_secret(value)}")
+        else:
+            set_header(headers, key, value)
+            notes.append(f"Header {key}: {mask_secret(value)}")
+    elif atype == "awsv4":
+        signed, err = aws_sign_v4(payload, auth["awsv4"], variables)
+        if err:
+            notes.append("AWS 签名失败：" + err)
+        else:
+            headers.update(signed)
+            notes.append(
+                "AWS Signature v4 已写入 Authorization / X-Amz-Date"
+                f"（region={substitute(auth['awsv4'].get('region', ''), variables) or 'us-east-1'},"
+                f" service={substitute(auth['awsv4'].get('service', ''), variables) or 'execute-api'}）"
+            )
+            if payload.get("files") is not None:
+                notes.append("提示：multipart 请求体未参与签名计算")
+    elif atype == "jwt":
+        cfg = auth["jwt"]
+        token, err = make_jwt(
+            cfg.get("algorithm", "HS256"),
+            substitute(cfg.get("secret", ""), variables),
+            substitute(cfg.get("payload", ""), variables),
+        )
+        if err:
+            notes.append("JWT 生成失败：" + err)
+        else:
+            value = (cfg.get("prefix") or "") + token
+            if (cfg.get("location") or "header") == "query":
+                name = (cfg.get("header_name") or "").strip() or "token"
+                params.append((name, token))
+                notes.append(f"Query 参数 {name}={mask_secret(token, 12)}")
+            else:
+                name = (cfg.get("header_name") or "").strip() or "Authorization"
+                set_header(headers, name, value)
+                notes.append(f"{name}: {mask_secret(value, 12)}")
+
+    payload["params"] = params or None
+    return notes
 
 
 def make_app_icon() -> QIcon:
@@ -434,6 +778,8 @@ class HttpWorker(QThread):
                 "verify": p.get("verify", True),
                 "allow_redirects": p.get("allow_redirects", True),
             }
+            if p.get("requests_auth") is not None:
+                kwargs["auth"] = p["requests_auth"]
             if p.get("files") is not None:
                 kwargs["files"] = p["files"]
             elif p.get("data") is not None:
@@ -619,6 +965,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.last_response = None
         self.current_request_id = None
+        self.auth = default_auth()
+        self._last_auth_notes = []
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(make_app_icon())
@@ -771,6 +1119,167 @@ class MainWindow(QMainWindow):
         pv.addLayout(pb)
         req_tabs.addTab(params_wrap, "Query 参数")
 
+        # Authorization
+        auth_wrap = QWidget()
+        av = QVBoxLayout(auth_wrap)
+        av.setContentsMargins(6, 6, 6, 6)
+        av.setSpacing(6)
+
+        arow = QHBoxLayout()
+        arow.addWidget(QLabel("认证方式："))
+        self.auth_type = QComboBox()
+        self.auth_type.addItems(AUTH_TYPE_LABELS)
+        self.auth_type.setFixedWidth(200)
+        self.auth_type.currentIndexChanged.connect(self._on_auth_type_changed)
+        arow.addWidget(self.auth_type)
+        self.auth_show_chk = QCheckBox("显示密钥")
+        self.auth_show_chk.stateChanged.connect(self._toggle_auth_secret)
+        arow.addWidget(self.auth_show_chk)
+        arow.addStretch(1)
+        av.addLayout(arow)
+
+        self.auth_stack = QStackedWidget()
+        self._auth_bindings = []
+        self._auth_secret_widgets = []
+
+        def auth_page(rows, hint=""):
+            page = QWidget()
+            outer = QVBoxLayout(page)
+            outer.setContentsMargins(0, 4, 0, 0)
+            form = QFormLayout()
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+            for label, widget, path, secret in rows:
+                if isinstance(widget, (QLineEdit, QPlainTextEdit)):
+                    widget.setMinimumWidth(430)
+                if path:
+                    self._bind_auth(path, widget, secret=secret)
+                form.addRow(label, widget)
+            outer.addLayout(form)
+            if hint:
+                lab = QLabel(hint)
+                lab.setWordWrap(True)
+                lab.setStyleSheet("color:#9aa0a6;")
+                outer.addWidget(lab)
+            outer.addStretch(1)
+            self.auth_stack.addWidget(page)
+
+        # 0 无认证
+        auth_page([], "该请求不携带任何认证信息。")
+
+        # 1 Bearer Token
+        self.auth_bearer_token = QLineEdit()
+        self.auth_bearer_token.setPlaceholderText("例如 {{token}}，或直接粘贴 Access Token")
+        auth_page(
+            [("Token：", self.auth_bearer_token, "bearer.token", True)],
+            "发送时自动添加请求头：Authorization: Bearer <Token>",
+        )
+
+        # 2 Basic Auth
+        self.auth_basic_user = QLineEdit()
+        self.auth_basic_user.setPlaceholderText("用户名")
+        self.auth_basic_pwd = QLineEdit()
+        self.auth_basic_pwd.setPlaceholderText("密码")
+        auth_page(
+            [
+                ("用户名：", self.auth_basic_user, "basic.username", False),
+                ("密码：", self.auth_basic_pwd, "basic.password", True),
+            ],
+            "以 HTTP Basic 方式发送（Authorization: Basic base64(用户名:密码)）。",
+        )
+
+        # 3 Digest Auth
+        self.auth_digest_user = QLineEdit()
+        self.auth_digest_user.setPlaceholderText("用户名")
+        self.auth_digest_pwd = QLineEdit()
+        self.auth_digest_pwd.setPlaceholderText("密码")
+        auth_page(
+            [
+                ("用户名：", self.auth_digest_user, "digest.username", False),
+                ("密码：", self.auth_digest_pwd, "digest.password", True),
+            ],
+            "HTTP Digest 摘要认证：首次请求收到 401 挑战后，自动按服务器 nonce 重发。",
+        )
+
+        # 4 API Key
+        self.auth_apikey_key = QLineEdit()
+        self.auth_apikey_key.setPlaceholderText("如 X-API-Key")
+        self.auth_apikey_value = QLineEdit()
+        self.auth_apikey_value.setPlaceholderText("如 {{api_key}}")
+        self.auth_apikey_in = QComboBox()
+        self.auth_apikey_in.addItem("Header", "header")
+        self.auth_apikey_in.addItem("Query 参数", "query")
+        auth_page(
+            [
+                ("Key 名称：", self.auth_apikey_key, "apikey.key", False),
+                ("Value：", self.auth_apikey_value, "apikey.value", True),
+                ("添加到：", self.auth_apikey_in, "apikey.in", False),
+            ],
+            "把 Key/Value 作为请求头或查询参数附加到请求上。",
+        )
+
+        # 5 AWS Signature v4
+        self.auth_aws_access = QLineEdit()
+        self.auth_aws_access.setPlaceholderText("AKIA...")
+        self.auth_aws_secret = QLineEdit()
+        self.auth_aws_secret.setPlaceholderText("Secret Access Key")
+        self.auth_aws_session = QLineEdit()
+        self.auth_aws_session.setPlaceholderText("可选，临时凭证才需要")
+        self.auth_aws_region = QLineEdit("us-east-1")
+        self.auth_aws_service = QLineEdit("execute-api")
+        auth_page(
+            [
+                ("Access Key：", self.auth_aws_access, "awsv4.access_key", False),
+                ("Secret Key：", self.auth_aws_secret, "awsv4.secret_key", True),
+                ("Session Token：", self.auth_aws_session, "awsv4.session_token", True),
+                ("Region：", self.auth_aws_region, "awsv4.region", False),
+                ("Service：", self.auth_aws_service, "awsv4.service", False),
+            ],
+            "按 AWS4-HMAC-SHA256 对当前方法 / 地址 / 查询串 / 请求体现场签名，"
+            "自动写入 X-Amz-Date 与 Authorization 头（API Gateway 常用 Service=execute-api）。",
+        )
+
+        # 6 JWT
+        self.auth_jwt_alg = QComboBox()
+        for alg in JWT_ALGORITHMS:
+            self.auth_jwt_alg.addItem(alg, alg)
+        self.auth_jwt_secret = QLineEdit()
+        self.auth_jwt_secret.setPlaceholderText("HS256/384/512 的签名密钥")
+        self.auth_jwt_payload = QPlainTextEdit()
+        self.auth_jwt_payload.setPlaceholderText('{\n    "sub": "1234567890"\n}')
+        self.auth_jwt_payload.setFixedHeight(96)
+        self.auth_jwt_loc = QComboBox()
+        self.auth_jwt_loc.addItem("Header", "header")
+        self.auth_jwt_loc.addItem("Query 参数", "query")
+        self.auth_jwt_name = QLineEdit("Authorization")
+        self.auth_jwt_prefix = QLineEdit("Bearer ")
+        auth_page(
+            [
+                ("算法：", self.auth_jwt_alg, "jwt.algorithm", False),
+                ("Secret：", self.auth_jwt_secret, "jwt.secret", True),
+                ("Payload：", self.auth_jwt_payload, "jwt.payload", False),
+                ("添加到：", self.auth_jwt_loc, "jwt.location", False),
+                ("名称：", self.auth_jwt_name, "jwt.header_name", False),
+                ("前缀：", self.auth_jwt_prefix, "jwt.prefix", False),
+            ],
+            "本地用密钥对 Payload 现场签发 JWT（HS256/HS384/HS512）。"
+            "iat / exp 等声明请自行写在 Payload 里。",
+        )
+
+        av.addWidget(self.auth_stack)
+
+        self.auth_preview = QLabel("不使用认证信息。")
+        self.auth_preview.setWordWrap(True)
+        self.auth_preview.setStyleSheet("color:#7ec8ff; padding:2px 0;")
+        av.addWidget(self.auth_preview)
+        av.addStretch(1)
+        req_tabs.addTab(auth_wrap, "Authorization")
+
+        # 认证预览跟随地址 / 方法 / 环境变化
+        self.url_edit.textChanged.connect(self._on_auth_changed)
+        self.method_combo.currentIndexChanged.connect(self._on_auth_changed)
+        self.env_combo.currentIndexChanged.connect(self._on_auth_changed)
+
         # Headers
         head_wrap = QWidget()
         hv2 = QVBoxLayout(head_wrap)
@@ -896,6 +1405,112 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def status_msg(self, text: str, ms: int = 4000) -> None:
         self.statusBar().showMessage(text, ms)
+
+    # ------------------------------------------------------------------
+    # 认证面板
+    # ------------------------------------------------------------------
+    def _bind_auth(self, path: str, widget, secret: bool = False) -> None:
+        self._auth_bindings.append((path, widget))
+        if secret:
+            self._auth_secret_widgets.append(widget)
+            widget.setEchoMode(QLineEdit.EchoMode.Password)
+        if isinstance(widget, QComboBox):
+            widget.currentIndexChanged.connect(self._on_auth_changed)
+        elif isinstance(widget, QPlainTextEdit):
+            widget.textChanged.connect(self._on_auth_changed)
+        else:
+            widget.textChanged.connect(self._on_auth_changed)
+
+    def _toggle_auth_secret(self) -> None:
+        show = self.auth_show_chk.isChecked()
+        mode = QLineEdit.EchoMode.Normal if show else QLineEdit.EchoMode.Password
+        for widget in self._auth_secret_widgets:
+            widget.setEchoMode(mode)
+
+    def _on_auth_type_changed(self, index: int) -> None:
+        if 0 <= index < self.auth_stack.count():
+            self.auth_stack.setCurrentIndex(index)
+        self._on_auth_changed()
+
+    def _on_auth_changed(self, *_args) -> None:
+        self._sync_auth_from_ui()
+        self._update_auth_preview()
+
+    @staticmethod
+    def _auth_widget_value(widget):
+        if isinstance(widget, QComboBox):
+            data = widget.currentData()
+            return data if data is not None else widget.currentText()
+        if isinstance(widget, QPlainTextEdit):
+            return widget.toPlainText()
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+        return ""
+
+    @staticmethod
+    def _auth_set_widget_value(widget, value) -> None:
+        value = "" if value is None else value
+        if isinstance(widget, QComboBox):
+            for i in range(widget.count()):
+                if widget.itemData(i) == value or widget.itemText(i) == value:
+                    widget.setCurrentIndex(i)
+                    return
+            widget.setCurrentIndex(0)
+        elif isinstance(widget, QPlainTextEdit):
+            widget.setPlainText(str(value))
+        elif isinstance(widget, QLineEdit):
+            widget.setText(str(value))
+
+    def _sync_auth_from_ui(self) -> None:
+        auth = merge_auth(self.auth)
+        index = self.auth_type.currentIndex()
+        if 0 <= index < len(AUTH_TYPE_KEYS):
+            auth["type"] = AUTH_TYPE_KEYS[index]
+        for path, widget in self._auth_bindings:
+            section, _, field = path.partition(".")
+            auth.setdefault(section, {})[field] = self._auth_widget_value(widget)
+        self.auth = auth
+
+    def auth_snapshot(self) -> dict:
+        return merge_auth(self.auth)
+
+    def set_auth(self, data) -> None:
+        auth = merge_auth(data)
+        for path, widget in self._auth_bindings:
+            section, _, field = path.partition(".")
+            self._auth_set_widget_value(widget, auth.get(section, {}).get(field, ""))
+        index = AUTH_TYPE_KEYS.index(auth["type"]) if auth["type"] in AUTH_TYPE_KEYS else 0
+        self.auth_type.blockSignals(True)
+        self.auth_type.setCurrentIndex(index)
+        self.auth_type.blockSignals(False)
+        self.auth_stack.setCurrentIndex(index)
+        self.auth = auth
+        self._update_auth_preview()
+
+    def _update_auth_preview(self) -> None:
+        auth = self.auth_snapshot()
+        if auth["type"] == "noauth":
+            self.auth_preview.setText("不使用认证信息。")
+            return
+        if auth["type"] == "awsv4" and not self.url_edit.text().strip():
+            self.auth_preview.setText("预览 → 请先填写请求地址（AWS 签名依赖 Host 与请求路径）")
+            return
+        probe = {
+            "method": self.method_combo.currentText(),
+            "url": substitute(self.url_edit.text().strip(), self.variables()),
+            "headers": {},
+            "params": [],
+            "data": None,
+            "files": None,
+            "json": None,
+            "requests_auth": None,
+        }
+        try:
+            notes = apply_auth(probe, auth, self.variables())
+        except Exception as e:  # noqa: BLE001
+            self.auth_preview.setText("认证预览失败：" + str(e))
+            return
+        self.auth_preview.setText("预览 → " + ("；".join(notes) if notes else "无变化"))
 
     def _settings(self) -> dict:
         return self.state.setdefault("settings", {})
@@ -1047,6 +1662,7 @@ class MainWindow(QMainWindow):
             "data": None,
             "files": None,
             "json": None,
+            "requests_auth": None,
         }
 
         if btype == "JSON":
@@ -1076,6 +1692,7 @@ class MainWindow(QMainWindow):
                 if not any(k.lower() == "content-type" for k in headers):
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
 
+        payload["_auth_notes"] = apply_auth(payload, self.auth, variables)
         payload["_raw_url"] = raw_url
         return payload
 
@@ -1099,6 +1716,7 @@ class MainWindow(QMainWindow):
         self._save_settings()
         save_state(self.state)
 
+        self._last_auth_notes = list(payload.get("_auth_notes") or [])
         self.worker = HttpWorker(payload, self)
         self.worker.done.connect(self._on_response)
         self.worker.failed.connect(self._on_failed)
@@ -1120,7 +1738,7 @@ class MainWindow(QMainWindow):
         self.resp_body.setPlainText(message)
         self.resp_headers.setRowCount(0)
         self._add_history(self._collect_request(), error=message)
-        self.status_msg("请求失败：" + message.splitlines()[0])
+        self.status_msg("请求失败：" + message.splitlines()[0] + self._auth_note_suffix(), 10000)
 
     def _on_response(self, data: dict) -> None:
         self.last_response = data
@@ -1143,7 +1761,14 @@ class MainWindow(QMainWindow):
         self._add_history(self._collect_request(), status=code)
         self.status_msg(
             f"请求完成：{code} · {fmt_ms(data['elapsed_ms'])} · {fmt_size(data['size'])}"
+            + self._auth_note_suffix(),
+            8000,
         )
+
+    def _auth_note_suffix(self) -> str:
+        if not self._last_auth_notes:
+            return ""
+        return "　|　认证：" + "；".join(self._last_auth_notes)
 
     def _render_response_body(self) -> None:
         if not self.last_response:
@@ -1207,6 +1832,7 @@ class MainWindow(QMainWindow):
             "body_json": self.body_json.toPlainText(),
             "body_form": self.body_form.pairs(with_enabled=True),
             "body_urlenc": self.body_urlenc.pairs(with_enabled=True),
+            "auth": self.auth_snapshot(),
         }
 
     def _rebuild_history(self) -> None:
@@ -1214,10 +1840,14 @@ class MainWindow(QMainWindow):
         for idx, h in enumerate(self.state.get("history", [])):
             status = h.get("status")
             tag = f"{status}" if status else ("ERR" if h.get("error") else "-")
-            item = QListWidgetItem(f"[{h.get('method')}] {tag}  {h.get('url', '')}")
+            auth_tag = auth_tag_of(h.get("request"))
+            suffix = f"　〔{auth_tag}〕" if auth_tag else ""
+            item = QListWidgetItem(f"[{h.get('method')}] {tag}  {h.get('url', '')}{suffix}")
             item.setToolTip(
                 f"时间：{h.get('time')}\n方法：{h.get('method')}\n地址：{h.get('url')}\n状态：{tag}"
             )
+            if auth_tag:
+                item.setToolTip(item.toolTip() + "　认证：" + auth_tag)
             item.setData(Qt.UserRole, idx)
             self.history_list.addItem(item)
 
@@ -1281,7 +1911,12 @@ class MainWindow(QMainWindow):
                 else:
                     item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
                     r = node.get("request", {})
-                    item.setToolTip(0, f"{r.get('method', 'GET')} {r.get('url', '')}")
+                    a_tag = auth_tag_of(r)
+                    item.setToolTip(
+                        0,
+                        f"{r.get('method', 'GET')} {r.get('url', '')}"
+                        + (f"　认证：{a_tag}" if a_tag else ""),
+                    )
                 if parent is None:
                     self.coll_tree.addTopLevelItem(item)
                 else:
@@ -1438,6 +2073,7 @@ class MainWindow(QMainWindow):
         self.body_json.setPlainText(req.get("body_json", ""))
         self.body_form.set_pairs(req.get("body_form", []))
         self.body_urlenc.set_pairs(req.get("body_urlenc", []))
+        self.set_auth(req.get("auth"))
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
@@ -1520,6 +2156,76 @@ def run_self_test() -> None:
         lines.append("json pretty ok: " + str(pretty_json('{"a":1}') is not None))
     except Exception as e:  # noqa: BLE001
         lines.append("json error: " + repr(e))
+    auth_ok = True
+    try:
+        probe = {
+            "method": "GET",
+            "url": "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08",
+            "headers": {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+            "params": [],
+            "data": None,
+            "files": None,
+            "json": None,
+            "requests_auth": None,
+        }
+        signed, err = aws_sign_v4(
+            probe,
+            {
+                "access_key": "AKIDEXAMPLE",
+                "secret_key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "session_token": "",
+                "region": "us-east-1",
+                "service": "iam",
+            },
+            {},
+            amz_date="20150830T123600Z",
+        )
+        good = signed is not None and (
+            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+            in signed.get("Authorization", "")
+        )
+        auth_ok = auth_ok and good
+        lines.append("aws sigv4 vector: " + ("ok" if good else "FAIL " + str(err or signed)))
+    except Exception as e:  # noqa: BLE001
+        auth_ok = False
+        lines.append("aws sigv4 error: " + repr(e))
+    try:
+        token, err = make_jwt(
+            "HS256",
+            "your-256-bit-secret",
+            '{"sub":"1234567890","name":"John Doe","iat":1516239022}',
+        )
+        expect = (
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+            ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        good = token == expect
+        auth_ok = auth_ok and good
+        lines.append("jwt hs256 vector: " + ("ok" if good else "FAIL " + str(token or err)))
+    except Exception as e:  # noqa: BLE001
+        auth_ok = False
+        lines.append("jwt error: " + repr(e))
+    try:
+        p2 = {
+            "method": "GET",
+            "url": "https://example.com/",
+            "headers": {},
+            "params": [],
+            "data": None,
+            "files": None,
+            "json": None,
+            "requests_auth": None,
+        }
+        apply_auth(p2, bearer_auth("abc"), {})
+        apply_auth(p2, {"type": "apikey", "apikey": {"key": "k", "value": "v", "in": "query"}}, {})
+        good = p2["headers"].get("Authorization") == "Bearer abc" and ("k", "v") in p2["params"]
+        auth_ok = auth_ok and good
+        lines.append("auth inject ok: " + str(good))
+    except Exception as e:  # noqa: BLE001
+        auth_ok = False
+        lines.append("auth inject error: " + repr(e))
+    ok = ok and auth_ok
     lines.append("frozen: " + str(getattr(sys, "frozen", False)))
     lines.append("data_dir: " + DATA_DIR)
     lines.append("requests: " + getattr(requests, "__version__", "?"))
@@ -1532,9 +2238,101 @@ def run_self_test() -> None:
     sys.exit(0 if ok else 2)
 
 
+def run_ui_shot(out_dir: str) -> None:
+    """`HttpLite.exe --ui-shot <目录>`：离屏渲染 Authorization 面板并截图，用于打包后界面核验。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    lines = []
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        lines.append("mkdir error: " + repr(e))
+    try:
+        qapp = QApplication(sys.argv)
+        qapp.setStyleSheet(QSS)
+        win = MainWindow()
+        win.resize(1240, 800)
+        win.show()
+        qapp.processEvents()
+        req_tabs = None
+        for t in win.findChildren(QTabWidget):
+            if "Authorization" in [t.tabText(i) for i in range(t.count())]:
+                req_tabs = t
+        lines.append("auth pages: " + str(win.auth_stack.count()))
+        lines.append("auth types: " + " / ".join(win.auth_type.itemText(i) for i in range(win.auth_type.count())))
+        lines.append("auth tab found: " + str(req_tabs is not None))
+        if req_tabs is not None:
+            labels = [req_tabs.tabText(i) for i in range(req_tabs.count())]
+            req_tabs.setCurrentIndex(labels.index("Authorization"))
+        win.url_edit.setText("https://api.example.com/v1/orders")
+        win.method_combo.setCurrentText("POST")
+        qapp.processEvents()
+        shots = [
+            ("auth_bearer.png", bearer_auth("eyJhbGciOiJIUzI1NiJ9.demo.token")),
+            ("auth_basic.png", merge_auth({"type": "basic", "basic": {"username": "demo", "password": "s3cret"}})),
+            (
+                "auth_apikey.png",
+                merge_auth(
+                    {"type": "apikey", "apikey": {"key": "X-API-Key", "value": "sk-live-123", "in": "query"}}
+                ),
+            ),
+            (
+                "auth_aws.png",
+                merge_auth(
+                    {
+                        "type": "awsv4",
+                        "awsv4": {
+                            "access_key": "AKIAIOSFODNN7EXAMPLE",
+                            "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                            "session_token": "",
+                            "region": "us-east-1",
+                            "service": "execute-api",
+                        },
+                    }
+                ),
+            ),
+            (
+                "auth_jwt.png",
+                merge_auth(
+                    {
+                        "type": "jwt",
+                        "jwt": {
+                            "algorithm": "HS256",
+                            "secret": "topsecret",
+                            "payload": '{\n    "sub": "1234567890",\n    "name": "HttpLite"\n}',
+                            "location": "header",
+                            "header_name": "Authorization",
+                            "prefix": "Bearer ",
+                        },
+                    }
+                ),
+            ),
+        ]
+        for name, cfg in shots:
+            win.set_auth(cfg)
+            qapp.processEvents()
+            ok = win.grab().save(os.path.join(out_dir, name))
+            lines.append(
+                f"{name} saved={ok} type={win.auth_type.currentText()} panel={win.auth_stack.currentIndex()}"
+            )
+        lines.append("preview: " + win.auth_preview.text()[:160])
+    except Exception as e:  # noqa: BLE001
+        lines.append("ui-shot error: " + repr(e))
+    try:
+        with open(os.path.join(out_dir, "HttpLite_uishot.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+    sys.exit(0)
+
+
 def main() -> None:
     if "--self-test" in sys.argv:
         run_self_test()
+        return
+    if "--ui-shot" in sys.argv:
+        pos = sys.argv.index("--ui-shot")
+        target = sys.argv[pos + 1] if len(sys.argv) > pos + 1 else app_dir()
+        run_ui_shot(target)
         return
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

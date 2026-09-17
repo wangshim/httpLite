@@ -1,0 +1,23 @@
+# 打包产物与构建目录
+build/
+dist/
+*.exe
+
+# 运行时数据（绿色便携数据目录）
+HttpLite_data/
+
+# 自检 / 界面截图输出
+HttpLite_selftest.txt
+HttpLite_uishot.txt
+ui_shot/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/

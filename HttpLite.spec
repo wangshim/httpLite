@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:/Users/123/AppData/Roaming/Tencent/Marvis/User/oAN1i2XrBlmiGSnPeHljdH4xqJis/workspace/conv_10af8416780e4fa587b8cf86d063d424/temp/httplite/app.py'],
+    ['F:/DevEnv/httplite-src/app.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/123/AppData/Roaming/Tencent/Marvis/User/oAN1i2XrBlmiGSnPeHljdH4xqJis/workspace/conv_10af8416780e4fa587b8cf86d063d424/temp/httplite/HttpLite.ico'],
+    icon=['F:/DevEnv/httplite-src/HttpLite.ico'],
 )
