@@ -39,9 +39,22 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 ### 响应查看
 - 状态码按语义着色（2xx 绿 / 3xx 蓝 / 4xx 橙 / 5xx 红）
 - 显示请求耗时与响应体大小
-- 「响应体 / 响应头」双标签展示
+- 「响应体 / 响应头 / 测试」三标签展示
 - JSON 响应自动高亮，「美化 JSON」开关可切换压缩 / 缩进视图
 - 一键「复制响应」到剪贴板
+
+### 测试 / 断言与变量提取
+- 响应面板新增**「测试」**标签页：表格化配置断言，发送请求后自动逐条执行
+- 内置 6 种断言：**状态码等于**、**状态码范围**（支持 `2xx` / `200-299` / `200` 写法）、**耗时小于(ms)**、**响应体包含**、**JSON 字段存在**（`$.data.token` 极简路径）、**JSON 字段值等于**
+- 断言逐条显示 ✔ 通过 / ✘ 失败及说明，顶部汇总 `通过数/总数`
+- 支持**变量提取**：从响应中按 JSON 路径或正则（有捕获组取第一组）提取值，自动写入**当前环境变量**，后续请求可用 `{{变量名}}` 引用
+- 断言与提取配置随请求一起保存到集合 / 历史，从集合加载时自动还原
+
+### Postman 导入 / 导出
+- **导入 Postman Collection v2.1**：`集合` 面板顶部「导入 Postman」按钮，选择导出的 `.json` 文件即可
+- 完整映射：请求方法、URL（含 Query 参数）、Headers、Body（JSON / raw / urlencoded / form-data）、Bearer / Basic / API Key 认证、文件夹树结构；同名集合重复导入时覆盖更新
+- **导出 Postman v2.1**：选中集合文件夹后「导出 Postman」按选中文件夹导出，未选中时导出全部集合；「导出选中请求」可把单个请求导出为独立集合文件，便于分享或迁回 Postman
+- 导出的 JSON 符合 v2.1 schema，可被 Postman / 其他工具直接导入
 
 ### 历史记录与集合
 - 每次发送自动写入**历史记录**，右键可重发、另存到集合、清空历史
@@ -120,8 +133,10 @@ python app.py
 2. 在「Query 参数」「Headers」「Body」「Authorization」标签页中按需配置请求内容
 3. 在右上角下拉框选择**环境**，必要时点开环境管理增删变量
 4. 点击「发送」（或 `Ctrl+Enter`），下方查看响应状态、耗时、大小与响应体 / 响应头
-5. 需要复用请求时点「保存到集合」（或 `Ctrl+S`），之后从左侧集合树双击 / 右键即可再次调用
-6. 所有改动（历史、集合、环境、设置）都会自动持久化到数据目录
+5. 需要自动校验响应时，切到「测试」标签添加断言（如状态码 `2xx`、`body 包含 success`）；需要把响应里的 `token` 等值带进后续请求时，在「变量提取」中填变量名与 JSON 路径 / 正则，发送后自动写入当前环境
+6. 需要复用请求时点「保存到集合」（或 `Ctrl+S`），之后从左侧集合树双击 / 右键即可再次调用
+7. 从 Postman 迁移：集合面板点「导入 Postman」选 v2.1 导出文件；分享给 Postman 用户：选中集合文件夹点「导出 Postman」（或右键选中请求点「导出选中请求」）
+8. 所有改动（历史、集合、环境、设置）都会自动持久化到数据目录
 
 ---
 
@@ -149,8 +164,8 @@ pyinstaller HttpLite.spec
 exe 内置两个免交互自检开关，便于确认打包产物在 frozen 环境下能力正常：
 
 ```bash
-HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON / 认证向量 / UI 冒烟，结果写入 exe 同级的 HttpLite_selftest.txt
-HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（认证面板 / 多标签 / 历史过滤），默认深色
+HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON / 认证向量 / Postman 导入导出 / 断言与提取 / UI 冒烟，结果写入 exe 同级的 HttpLite_selftest.txt
+HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（认证面板 / 多标签 / 历史过滤 / 测试断言），默认深色
 ```
 
 ---
@@ -159,6 +174,7 @@ HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（�
 
 - **语言**：Python 3.11
 - **GUI**：PySide6（Qt for Python），单窗口 + 多标签页布局，`QSyntaxHighlighter` 实现 JSON 高亮，内置深 / 浅两套 QSS 主题并支持运行时切换
+- **Postman 互通**：Collection v2.1 JSON 解析 / 生成（URL、Headers、Body、认证、文件夹树），支持极简 JSON 路径与正则表达式断言 / 提取
 - **网络**：requests（含 `HTTPDigestAuth`），请求在独立 `QThread` 中执行，避免阻塞界面
 - **认证签名**：标准库 `hmac` / `hashlib` / `base64` 手写实现 AWS Signature v4 与 JWT 签发
 - **数据持久化**：单个 `workspace.json` 文件

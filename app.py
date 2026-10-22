@@ -587,6 +587,498 @@ def apply_auth(payload: dict, auth: dict, variables: dict) -> list:
     payload["params"] = params or None
     return notes
 
+# --------------------------------------------------------------------------
+# Postman 集合导入 / 导出
+# --------------------------------------------------------------------------
+POSTMAN_SCHEMA = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+
+
+def _postman_url_parts(url) -> tuple:
+    """把 Postman url（字符串或对象）拆成 (raw_url, params)。
+
+    params 为 HttpLite 参数列表（query 数组映射而来）。若 raw 已含 query
+    且 Postman 同时给了 query 数组，则剥掉 raw 里的 query，避免发送时重复。
+    """
+    if isinstance(url, str):
+        return url, []
+    if not isinstance(url, dict):
+        return "", []
+    raw = url.get("raw", "") or ""
+    host = url.get("host", [])
+    path = url.get("path", [])
+    query = url.get("query", []) or []
+    params = []
+    for q in query:
+        if isinstance(q, dict) and not q.get("disabled", False):
+            params.append(
+                {"key": str(q.get("key", "")), "value": str(q.get("value", "")), "enabled": True}
+            )
+    if raw:
+        if params and "?" in raw:
+            return raw.split("?", 1)[0], params
+        return raw, params
+    host_s = ".".join(str(x) for x in host) if isinstance(host, list) else ""
+    path_s = "/".join(str(x) for x in path) if isinstance(path, list) else ""
+    result = host_s
+    if path_s:
+        result = (result + "/" if result else "") + path_s
+    if params:
+        result += "?" + "&".join(f"{p['key']}={p['value']}" for p in params)
+    return result, params
+
+
+def _postman_auth_to_internal(auth) -> dict:
+    """把 Postman 认证对象映射为 HttpLite auth 结构。"""
+    if not isinstance(auth, dict):
+        return default_auth()
+
+    def pick(items, key):
+        if not isinstance(items, list):
+            return ""
+        for it in items:
+            if isinstance(it, dict) and it.get("key") == key:
+                return str(it.get("value", ""))
+        return ""
+
+    atype = auth.get("type", "noauth")
+    if atype == "bearer":
+        return bearer_auth(pick(auth.get("bearer", []), "token"))
+    if atype == "basic":
+        return {
+            "type": "basic",
+            "basic": {
+                "username": pick(auth.get("basic", []), "username"),
+                "password": pick(auth.get("basic", []), "password"),
+            },
+        }
+    if atype == "apikey":
+        return {
+            "type": "apikey",
+            "apikey": {
+                "key": pick(auth.get("apikey", []), "key"),
+                "value": pick(auth.get("apikey", []), "value"),
+                "in": pick(auth.get("apikey", []), "in") or "header",
+            },
+        }
+    return default_auth()
+
+
+def _postman_body_to_internal(body) -> dict:
+    """把 Postman body 对象映射为 HttpLite 请求体结构。"""
+    out = {"body_type": "none", "body_json": "", "body_form": [], "body_urlenc": []}
+    if not isinstance(body, dict):
+        return out
+    mode = body.get("mode", "")
+    if mode == "raw":
+        raw = body.get("raw", "") or ""
+        stripped = raw.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                json.loads(stripped)
+                out["body_type"] = "JSON"
+                out["body_json"] = pretty_json(stripped) or stripped
+                return out
+            except Exception:
+                pass
+        out["body_type"] = "raw"
+        out["body_json"] = raw
+        return out
+    if mode == "urlencoded":
+        items = []
+        for kv in body.get("urlencoded", []) or []:
+            if isinstance(kv, dict):
+                items.append(
+                    {
+                        "key": str(kv.get("key", "")),
+                        "value": str(kv.get("value", "")),
+                        "enabled": not kv.get("disabled", False),
+                    }
+                )
+        out["body_type"] = "x-www-form-urlencoded"
+        out["body_urlenc"] = items
+        return out
+    if mode == "formdata":
+        items = []
+        for kv in body.get("formdata", []) or []:
+            if isinstance(kv, dict):
+                items.append(
+                    {
+                        "key": str(kv.get("key", "")),
+                        "value": str(kv.get("value", "")),
+                        "enabled": not kv.get("disabled", False),
+                    }
+                )
+        out["body_type"] = "form-data"
+        out["body_form"] = items
+        return out
+    return out
+
+
+def _postman_request_to_internal(pm_request) -> dict:
+    """单个 Postman request 对象 -> HttpLite request dict。"""
+    if not isinstance(pm_request, dict):
+        pm_request = {}
+    method = str(pm_request.get("method", "GET") or "GET")
+    raw_url, params = _postman_url_parts(pm_request.get("url", ""))
+    headers = []
+    for h in pm_request.get("header", []) or []:
+        if isinstance(h, dict):
+            headers.append(
+                {
+                    "key": str(h.get("key", "")),
+                    "value": str(h.get("value", "")),
+                    "enabled": not h.get("disabled", False),
+                }
+            )
+    body = _postman_body_to_internal(pm_request.get("body", {}))
+    return {
+        "method": method,
+        "url": raw_url,
+        "params": params,
+        "headers": headers,
+        "body_type": body["body_type"],
+        "body_json": body["body_json"],
+        "body_form": body["body_form"],
+        "body_urlenc": body["body_urlenc"],
+        "auth": _postman_auth_to_internal(pm_request.get("auth", {})),
+    }
+
+
+def parse_postman_collection(text: str):
+    """解析 Postman Collection v2.1 JSON 文本，返回 (nodes, errors)。
+
+    nodes: 顶层 HttpLite 节点列表（通常一个 folder，名字取 info.name）；
+    解析失败时 nodes 为 None，errors 给出原因。
+    """
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        return None, ["JSON 解析失败：" + str(e)]
+    if not isinstance(data, dict) or "item" not in data:
+        return None, ["不是有效的 Postman Collection v2.1 JSON（缺少 item 字段）"]
+    name = str((data.get("info") or {}).get("name", "导入的集合") or "导入的集合")
+    counter = [0]
+
+    def new_id():
+        counter[0] += 1
+        return f"n{int(time.time() * 1000)}{os.urandom(2).hex()}{counter[0]}"
+
+    def walk(items):
+        nodes = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            if "request" in it:
+                nodes.append(
+                    {
+                        "id": new_id(),
+                        "type": "request",
+                        "name": str(it.get("name", "未命名请求")),
+                        "request": _postman_request_to_internal(it.get("request", {})),
+                    }
+                )
+            else:
+                nodes.append(
+                    {
+                        "id": new_id(),
+                        "type": "folder",
+                        "name": str(it.get("name", "未命名文件夹")),
+                        "children": walk(it.get("item", [])),
+                    }
+                )
+        return nodes
+
+    items = data.get("item", [])
+    # 顶层仅有一个与 info.name 同名、且不含 request 的文件夹时，直接取其 children，
+    # 避免 HttpLite 导出的集合再导入时产生一层冗余嵌套。
+    if (
+        len(items) == 1
+        and isinstance(items[0], dict)
+        and "request" not in items[0]
+        and str(items[0].get("name", "")) == name
+    ):
+        items = items[0].get("item", [])
+    return [{"id": new_id(), "type": "folder", "name": name, "children": walk(items)}], []
+
+
+def _internal_request_to_postman(req) -> dict:
+    """HttpLite request dict -> Postman request 对象。"""
+    req = req or {}
+    method = str(req.get("method", "GET") or "GET")
+    url = req.get("url", "") or ""
+    params = req.get("params", []) or []
+    raw_url = url
+    if params:
+        sep = "&" if "?" in url else "?"
+        raw_url = url + sep + "&".join(
+            f"{p.get('key', '')}={p.get('value', '')}"
+            for p in params
+            if isinstance(p, dict) and p.get("enabled", True)
+        )
+    headers = []
+    for h in req.get("headers", []) or []:
+        if isinstance(h, dict):
+            headers.append(
+                {
+                    "key": str(h.get("key", "")),
+                    "value": str(h.get("value", "")),
+                    "disabled": not h.get("enabled", True),
+                }
+            )
+    btype = req.get("body_type", "none")
+    body = {"mode": "raw", "raw": ""}
+    if btype == "JSON":
+        body = {"mode": "raw", "raw": req.get("body_json", "") or "", "options": {"raw": {"language": "json"}}}
+    elif btype == "x-www-form-urlencoded":
+        body = {
+            "mode": "urlencoded",
+            "urlencoded": [
+                {"key": str(i.get("key", "")), "value": str(i.get("value", "")), "disabled": not i.get("enabled", True)}
+                for i in req.get("body_urlenc", []) or []
+            ],
+        }
+    elif btype == "form-data":
+        body = {
+            "mode": "formdata",
+            "formdata": [
+                {
+                    "key": str(i.get("key", "")),
+                    "value": str(i.get("value", "")),
+                    "disabled": not i.get("enabled", True),
+                    "type": "text",
+                }
+                for i in req.get("body_form", []) or []
+            ],
+        }
+    auth = {"type": "noauth"}
+    a = req.get("auth") or default_auth()
+    atype = a.get("type", "noauth")
+    if atype == "bearer":
+        auth = {"type": "bearer", "bearer": [{"key": "token", "value": str((a.get("bearer") or {}).get("token", "")), "type": "string"}]}
+    elif atype == "basic":
+        auth = {"type": "basic", "basic": [
+            {"key": "username", "value": str((a.get("basic") or {}).get("username", "")), "type": "string"},
+            {"key": "password", "value": str((a.get("basic") or {}).get("password", "")), "type": "string"},
+        ]}
+    elif atype == "apikey":
+        auth = {"type": "apikey", "apikey": [
+            {"key": "key", "value": str((a.get("apikey") or {}).get("key", "")), "type": "string"},
+            {"key": "value", "value": str((a.get("apikey") or {}).get("value", "")), "type": "string"},
+            {"key": "in", "value": str((a.get("apikey") or {}).get("in", "header")), "type": "string"},
+        ]}
+    url_obj = {"raw": raw_url, "host": [], "path": [], "query": []}
+    try:
+        from urllib.parse import urlsplit, parse_qsl
+
+        parts = urlsplit(raw_url)
+        if parts.scheme and parts.netloc:
+            url_obj["host"] = [parts.scheme + "://" + parts.netloc]
+            url_obj["path"] = [p for p in parts.path.split("/") if p] or [""]
+            url_obj["query"] = [
+                {"key": k, "value": v}
+                for k, v in parse_qsl(parts.query)
+            ]
+        elif parts.path:
+            url_obj["path"] = [p for p in parts.path.split("/") if p] or [""]
+    except Exception:
+        pass
+    return {"method": method, "url": url_obj, "header": headers, "body": body, "auth": auth}
+
+
+def build_postman_collection(nodes, name="HttpLite 集合", _postman_id=None):
+    """HttpLite 集合节点树 -> Postman Collection v2.1 dict。"""
+    import uuid
+
+    def walk(items):
+        out = []
+        for node in items or []:
+            if node.get("type") == "folder":
+                out.append({"name": str(node.get("name", "")), "item": walk(node.get("children", []))})
+            else:
+                out.append(
+                    {
+                        "name": str(node.get("name", "")),
+                        "request": _internal_request_to_postman(node.get("request", {})),
+                        "response": [],
+                    }
+                )
+        return out
+
+    return {
+        "info": {
+            "_postman_id": _postman_id or uuid.uuid4().hex,
+            "name": name,
+            "schema": POSTMAN_SCHEMA,
+            "description": "由 HttpLite 导出的 Postman Collection v2.1",
+        },
+        "item": walk(nodes),
+    }
+
+
+def _count_requests(node) -> int:
+    """统计节点树中的请求数。"""
+    if node.get("type") == "request":
+        return 1
+    return sum(_count_requests(c) for c in node.get("children", []))
+
+
+# --------------------------------------------------------------------------
+# 响应断言与变量提取（纯函数，离屏可测）
+# --------------------------------------------------------------------------
+ASSERT_TYPES = [
+    ("status_eq", "状态码等于"),
+    ("status_range", "状态码范围"),
+    ("time_lt", "耗时小于(ms)"),
+    ("body_contains", "响应体包含"),
+    ("json_exists", "JSON 字段存在"),
+    ("json_eq", "JSON 字段值等于"),
+]
+EXTRACT_TYPES = [
+    ("jsonpath", "JSON 路径"),
+    ("regex", "正则"),
+]
+
+
+def eval_simple_path(obj, path: str):
+    """极简 JSON 路径求值：支持 $.a.b[0].c / a.b.c / $[0].name。
+
+    返回 (ok, value)；未命中时 ok=False。
+    """
+    path = (path or "").strip()
+    if not path:
+        return False, None
+    if path.startswith("$"):
+        path = path[1:]
+    cur = obj
+    i = 0
+    n = len(path)
+    while i < n:
+        ch = path[i]
+        if ch == ".":
+            i += 1
+            continue
+        if ch == "[":
+            j = path.find("]", i)
+            if j < 0:
+                return False, None
+            inner = path[i + 1 : j].strip().strip("\"'").strip()
+            i = j + 1
+            if inner.isdigit():
+                if isinstance(cur, list) and int(inner) < len(cur):
+                    cur = cur[int(inner)]
+                else:
+                    return False, None
+            elif isinstance(cur, dict) and inner in cur:
+                cur = cur[inner]
+            else:
+                return False, None
+        else:
+            j = i
+            while j < n and path[j] not in ".[":
+                j += 1
+            key = path[i:j]
+            i = j
+            if key == "":
+                continue
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                return False, None
+    return True, cur
+
+
+def parse_status_range(spec: str):
+    """解析 2xx / 200-299 / 200 三种写法，返回 (lo, hi) 或 None。"""
+    spec = (spec or "").strip().lower()
+    m = re.fullmatch(r"([2345])xx", spec)
+    if m:
+        lo = int(m.group(1)) * 100
+        return lo, lo + 99
+    m = re.fullmatch(r"(\d+)-(\d+)", spec)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.fullmatch(r"(\d+)", spec)
+    if m:
+        v = int(m.group(1))
+        return v, v
+    return None
+
+
+def evaluate_assertion(atype, arg1, arg2, ctx) -> tuple:
+    """执行单条断言，返回 (ok, desc)。
+
+    ctx 形如 {"status": int, "elapsed_ms": int, "text": str, "json": obj}。
+    """
+    ok = False
+    desc = ""
+    try:
+        if atype == "status_eq":
+            want = str(arg1 or "").strip()
+            got = str(ctx.get("status", ""))
+            ok = got == want
+            desc = f"状态码 == {want}（实际 {got}）"
+        elif atype == "status_range":
+            rng = parse_status_range(str(arg1 or ""))
+            st = ctx.get("status")
+            if rng is None:
+                desc = f"无法解析范围：{arg1}"
+            else:
+                ok = rng[0] <= st <= rng[1]
+                desc = f"状态码 {rng[0]}-{rng[1]}（实际 {st}）"
+        elif atype == "time_lt":
+            try:
+                limit = float(arg1 or 0)
+            except Exception:
+                limit = 0
+            got = ctx.get("elapsed_ms", 0) or 0
+            ok = got < limit
+            desc = f"耗时 < {limit:.0f} ms（实际 {got:.0f} ms）"
+        elif atype == "body_contains":
+            text = ctx.get("text", "") or ""
+            ok = str(arg1 or "") in text
+            desc = f"响应体包含「{arg1}」"
+        elif atype == "json_exists":
+            found, _ = eval_simple_path(ctx.get("json"), str(arg1 or ""))
+            ok = found
+            desc = f"JSON 字段 {arg1} 存在"
+        elif atype == "json_eq":
+            found, val = eval_simple_path(ctx.get("json"), str(arg1 or ""))
+            ok = found and str(val) == str(arg2 or "")
+            desc = f"JSON 字段 {arg1} == {arg2}（实际 {val if found else '不存在'}）"
+        else:
+            desc = f"未知断言类型：{atype}"
+    except Exception as e:  # noqa: BLE001
+        desc = f"断言执行异常：{e}"
+    return ok, desc
+
+
+def run_extract(etype, expr, text, json_obj) -> tuple:
+    """执行一条变量提取，返回 (ok, value)。
+
+    etype 为 jsonpath 或 regex；jsonpath 取 json_obj 的路径值，
+    regex 对 text 做匹配（有捕获组取 group(1)，否则取整个匹配）。
+    """
+    try:
+        if etype == "jsonpath":
+            ok, val = eval_simple_path(json_obj, str(expr or ""))
+            if ok:
+                if isinstance(val, str):
+                    return True, val
+                return True, json.dumps(val, ensure_ascii=False)
+            return False, None
+        if etype == "regex":
+            m = re.search(str(expr or ""), text or "")
+            if not m:
+                return False, None
+            if m.groups():
+                return True, m.group(1)
+            return True, m.group(0)
+    except Exception:  # noqa: BLE001
+        return False, None
+    return False, None
+
+
+
 
 def make_app_icon() -> QIcon:
     pm = QPixmap(256, 256)
@@ -973,6 +1465,9 @@ class RequestTab(QWidget):
         self._auth_bindings = []
         self._auth_secret_widgets = []
         self._auth_hints = []
+        self.tests = []
+        self.extracts = []
+        self._last_json = None
         self._build_ui()
         if initial:
             self.apply_request(initial)
@@ -1293,6 +1788,73 @@ class RequestTab(QWidget):
         self.resp_headers.verticalHeader().setVisible(False)
         self.resp_headers.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.resp_tabs.addTab(self.resp_headers, "响应头")
+
+        # 测试 / 变量提取
+        tests_wrap = QWidget()
+        tv = QVBoxLayout(tests_wrap)
+        tv.setContentsMargins(6, 6, 6, 6)
+        tv.setSpacing(6)
+
+        tlab = QLabel("断言（发送请求后自动执行，逐条显示通过 / 失败并汇总）：")
+        tlab.setStyleSheet(self._hint_style())
+        tv.addWidget(tlab)
+        self.tests_table = QTableWidget(0, 4)
+        self.tests_table.setHorizontalHeaderLabels(["启用", "断言类型", "参数", "期望值"])
+        self.tests_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tests_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tests_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.tests_table.verticalHeader().setVisible(False)
+        self.tests_table.setColumnWidth(0, 46)
+        self.tests_table.setColumnWidth(3, 140)
+        self.tests_table.cellChanged.connect(self._mark_dirty)
+        tv.addWidget(self.tests_table, 1)
+        tbtn = QHBoxLayout()
+        b_add = QPushButton("添加断言")
+        b_add.clicked.connect(lambda: self._add_assertion_row())
+        b_del = QPushButton("删除选中")
+        b_del.clicked.connect(self._delete_assertion_rows)
+        b_run = QPushButton("重新执行")
+        b_run.clicked.connect(self._rerun_tests)
+        tbtn.addWidget(b_add)
+        tbtn.addWidget(b_del)
+        tbtn.addWidget(b_run)
+        tbtn.addStretch(1)
+        tv.addLayout(tbtn)
+        self.test_result = QLabel("发送请求后自动执行断言。")
+        self.test_result.setWordWrap(True)
+        self.test_result.setTextFormat(Qt.RichText)
+        tv.addWidget(self.test_result)
+
+        tv.addSpacing(10)
+        elab = QLabel("变量提取（从响应中提取值写入当前环境变量，后续请求可用 {{变量}} 引用）：")
+        elab.setStyleSheet(self._hint_style())
+        tv.addWidget(elab)
+        self.extract_table = QTableWidget(0, 3)
+        self.extract_table.setHorizontalHeaderLabels(["变量名", "类型", "表达式"])
+        self.extract_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.extract_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.extract_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.extract_table.verticalHeader().setVisible(False)
+        self.extract_table.setColumnWidth(0, 150)
+        self.extract_table.setColumnWidth(1, 110)
+        self.extract_table.cellChanged.connect(self._mark_dirty)
+        tv.addWidget(self.extract_table, 1)
+        ebtn = QHBoxLayout()
+        b_eadd = QPushButton("添加提取")
+        b_eadd.clicked.connect(lambda: self._add_extract_row())
+        b_edel = QPushButton("删除选中")
+        b_edel.clicked.connect(self._delete_extract_rows)
+        ebtn.addWidget(b_eadd)
+        ebtn.addWidget(b_edel)
+        ebtn.addStretch(1)
+        tv.addLayout(ebtn)
+        self.extract_result = QLabel("")
+        self.extract_result.setWordWrap(True)
+        self.extract_result.setTextFormat(Qt.RichText)
+        tv.addWidget(self.extract_result)
+        tv.addStretch(1)
+
+        self.resp_tabs.addTab(tests_wrap, "测试")
         rv.addWidget(self.resp_tabs, 1)
         split.addWidget(self.req_tabs)
         split.addWidget(resp_wrap)
@@ -1615,6 +2177,8 @@ class RequestTab(QWidget):
         self.size_label.setText("大小：-")
         self.resp_body.setPlainText(message)
         self.resp_headers.setRowCount(0)
+        self.test_result.setText('<span style="color:#f05f5f;">请求失败，未执行断言。</span>')
+        self.extract_result.setText("")
         self._main._add_history(self.snapshot(), error=message)
         self._main.status_msg("请求失败：" + message.splitlines()[0] + self._auth_note_suffix(), 10000)
 
@@ -1634,6 +2198,7 @@ class RequestTab(QWidget):
             self.resp_headers.setItem(i, 0, QTableWidgetItem(str(k)))
             self.resp_headers.setItem(i, 1, QTableWidgetItem(str(v)))
 
+        self._run_tests_and_extracts(data)
         self._main._add_history(self.snapshot(), status=code)
         self._main.status_msg(
             f"请求完成：{code} · {fmt_ms(data['elapsed_ms'])} · {fmt_size(data['size'])}"
@@ -1683,6 +2248,164 @@ class RequestTab(QWidget):
     # ------------------------------------------------------------------
     # 请求快照 / 载入
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 断言 / 变量提取辅助
+    # ------------------------------------------------------------------
+    def _add_assertion_row(self, atype="status_eq", arg1="", arg2=""):
+        row = self.tests_table.rowCount()
+        self.tests_table.insertRow(row)
+        chk = QCheckBox()
+        chk.setChecked(True)
+        chk.stateChanged.connect(self._mark_dirty)
+        self.tests_table.setCellWidget(row, 0, chk)
+        cb = QComboBox()
+        for key, lab in ASSERT_TYPES:
+            cb.addItem(lab, key)
+        idx = next((i for i in range(cb.count()) if cb.itemData(i) == atype), 0)
+        cb.setCurrentIndex(idx)
+        cb.currentIndexChanged.connect(self._mark_dirty)
+        self.tests_table.setCellWidget(row, 1, cb)
+        self.tests_table.setItem(row, 2, QTableWidgetItem(str(arg1)))
+        self.tests_table.setItem(row, 3, QTableWidgetItem(str(arg2)))
+
+    def _delete_assertion_rows(self):
+        rows = sorted({i.row() for i in self.tests_table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.tests_table.removeRow(r)
+        if rows:
+            self._mark_dirty()
+
+    def _add_extract_row(self, key="", etype="jsonpath", expr=""):
+        row = self.extract_table.rowCount()
+        self.extract_table.insertRow(row)
+        self.extract_table.setItem(row, 0, QTableWidgetItem(str(key)))
+        cb = QComboBox()
+        for tkey, tlab in EXTRACT_TYPES:
+            cb.addItem(tlab, tkey)
+        idx = next((i for i in range(cb.count()) if cb.itemData(i) == etype), 0)
+        cb.setCurrentIndex(idx)
+        cb.currentIndexChanged.connect(self._mark_dirty)
+        self.extract_table.setCellWidget(row, 1, cb)
+        self.extract_table.setItem(row, 2, QTableWidgetItem(str(expr)))
+
+    def _delete_extract_rows(self):
+        rows = sorted({i.row() for i in self.extract_table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.extract_table.removeRow(r)
+        if rows:
+            self._mark_dirty()
+
+    def _collect_tests_from_ui(self) -> list:
+        out = []
+        for row in range(self.tests_table.rowCount()):
+            w = self.tests_table.cellWidget(row, 0)
+            enabled = bool(w.isChecked()) if isinstance(w, QCheckBox) else True
+            cb = self.tests_table.cellWidget(row, 1)
+            atype = cb.currentData() if isinstance(cb, QComboBox) else "status_eq"
+            arg1 = self.tests_table.item(row, 2).text() if self.tests_table.item(row, 2) else ""
+            arg2 = self.tests_table.item(row, 3).text() if self.tests_table.item(row, 3) else ""
+            out.append({"enabled": enabled, "type": atype, "arg1": arg1, "arg2": arg2})
+        return out
+
+    def _collect_extracts_from_ui(self) -> list:
+        out = []
+        for row in range(self.extract_table.rowCount()):
+            key = self.extract_table.item(row, 0).text() if self.extract_table.item(row, 0) else ""
+            cb = self.extract_table.cellWidget(row, 1)
+            etype = cb.currentData() if isinstance(cb, QComboBox) else "jsonpath"
+            expr = self.extract_table.item(row, 2).text() if self.extract_table.item(row, 2) else ""
+            out.append({"key": key, "type": etype, "expr": expr})
+        return out
+
+    def _load_tests_from_data(self, tests) -> None:
+        self.tests_table.setRowCount(0)
+        for t in tests or []:
+            if isinstance(t, dict):
+                self._add_assertion_row(t.get("type", "status_eq"), t.get("arg1", ""), t.get("arg2", ""))
+
+    def _load_extracts_from_data(self, extracts) -> None:
+        self.extract_table.setRowCount(0)
+        for e in extracts or []:
+            if isinstance(e, dict):
+                self._add_extract_row(e.get("key", ""), e.get("type", "jsonpath"), e.get("expr", ""))
+
+    def _rerun_tests(self):
+        if self.last_response is None:
+            self._main.status_msg("暂无响应，无法执行断言")
+            return
+        self._run_tests_and_extracts(self.last_response)
+
+    def _run_tests_and_extracts(self, data: dict) -> None:
+        text = data.get("text", "") or ""
+        try:
+            json_obj = json.loads(text)
+        except Exception:  # noqa: BLE001
+            json_obj = None
+        self._last_json = json_obj
+        ctx = {
+            "status": data.get("status_code"),
+            "elapsed_ms": data.get("elapsed_ms", 0),
+            "text": text,
+            "json": json_obj,
+        }
+        self._run_tests_ui(ctx)
+        self._run_extracts_ui(ctx)
+
+    def _run_tests_ui(self, ctx: dict) -> None:
+        tests = [t for t in self._collect_tests_from_ui() if t.get("enabled")]
+        if not tests:
+            self.test_result.setText('<span style="color:%s;">暂无启用断言。</span>' % THEME_COLORS[self._theme]["hint"])
+            return
+        passed = 0
+        rows = []
+        for t in tests:
+            ok, desc = evaluate_assertion(t.get("type"), t.get("arg1"), t.get("arg2"), ctx)
+            if ok:
+                passed += 1
+                rows.append('<span style="color:#3ecf8e;">✔ 通过</span>　' + desc)
+            else:
+                rows.append('<span style="color:#f05f5f;">✘ 失败</span>　' + desc)
+        total = len(tests)
+        color = "#3ecf8e" if passed == total else "#f0a45d"
+        self.test_result.setText(
+            "<b>断言汇总：<span style='color:%s;'>%d/%d 通过</span></b><br/>" % (color, passed, total) + "<br/>".join(rows)
+        )
+
+    def _run_extracts_ui(self, ctx: dict) -> None:
+        items = [e for e in self._collect_extracts_from_ui() if str(e.get("key", "")).strip()]
+        if not items:
+            self.extract_result.setText("")
+            return
+        lines = []
+        written = 0
+        for e in items:
+            ok, val = run_extract(e.get("type"), e.get("expr"), ctx.get("text", ""), ctx.get("json"))
+            if ok:
+                self._main.set_env_variable(str(e["key"]).strip(), str(val))
+                written += 1
+                lines.append(
+                    '<span style="color:#3ecf8e;">✔ 已写入</span>　'
+                    + str(e["key"]).strip()
+                    + " = "
+                    + str(val)[:60]
+                )
+            else:
+                lines.append(
+                    '<span style="color:#f05f5f;">✘ 提取失败</span>　'
+                    + str(e["key"]).strip()
+                    + "（"
+                    + str(e.get("type"))
+                    + ": "
+                    + str(e.get("expr"))
+                    + "）"
+                )
+        color = "#3ecf8e" if written == len(items) else "#f0a45d"
+        self.extract_result.setText(
+            "<b>变量提取：<span style='color:%s;'>%d/%d 成功</span></b><br/>" % (color, written, len(items)) + "<br/>".join(lines)
+        )
+        if written:
+            self._main.status_msg(f"变量提取完成：{written} 个变量已写入当前环境", 6000)
+
     def snapshot(self) -> dict:
         return {
             "method": self.method_combo.currentText(),
@@ -1694,6 +2417,8 @@ class RequestTab(QWidget):
             "body_form": self.body_form.pairs(with_enabled=True),
             "body_urlenc": self.body_urlenc.pairs(with_enabled=True),
             "auth": self.auth_snapshot(),
+            "tests": self._collect_tests_from_ui(),
+            "extracts": self._collect_extracts_from_ui(),
         }
 
     def apply_request(self, req: dict) -> None:
@@ -1715,6 +2440,8 @@ class RequestTab(QWidget):
             self.body_form.set_pairs(req.get("body_form", []))
             self.body_urlenc.set_pairs(req.get("body_urlenc", []))
             self.set_auth(req.get("auth"))
+            self._load_tests_from_data(req.get("tests"))
+            self._load_extracts_from_data(req.get("extracts"))
         finally:
             self._suppress_dirty = False
         self.is_dirty = False
@@ -1952,6 +2679,17 @@ class MainWindow(QMainWindow):
         self.coll_tree.itemDoubleClicked.connect(self._load_collection_item)
         self.coll_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.coll_tree.customContextMenuRequested.connect(self._collection_menu)
+        coll_bar = QHBoxLayout()
+        b_imp = QPushButton("导入 Postman")
+        b_imp.clicked.connect(self.import_postman)
+        b_exp = QPushButton("导出 Postman")
+        b_exp.clicked.connect(self.export_postman)
+        b_sel = QPushButton("导出选中请求")
+        b_sel.clicked.connect(self.export_postman_request)
+        coll_bar.addWidget(b_imp)
+        coll_bar.addWidget(b_exp)
+        coll_bar.addWidget(b_sel)
+        cv.addLayout(coll_bar)
         cv.addWidget(self.coll_tree, 1)
         left.addTab(coll_wrap, "集合")
 
@@ -2414,6 +3152,96 @@ class MainWindow(QMainWindow):
                 self._rebuild_collections()
                 self.status_msg("已删除集合条目")
 
+    # ------------------------------------------------------------------
+    # Postman 导入 / 导出
+    # ------------------------------------------------------------------
+    def import_postman(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入 Postman 集合", "", "Postman Collection (*.json);;JSON (*.json);;所有文件 (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+        nodes, errors = parse_postman_collection(text)
+        if nodes is None:
+            QMessageBox.warning(self, "导入失败", "\n".join(errors))
+            return
+        colls = self.state.setdefault("collections", [])
+        name = nodes[0].get("name", "导入的集合")
+        existing = [c for c in colls if c.get("name") == name]
+        if existing:
+            existing[0]["children"] = nodes[0].get("children", [])
+        else:
+            colls.append(nodes[0])
+        save_state(self.state)
+        self._rebuild_collections()
+        count = _count_requests(nodes[0])
+        msg = f"导入成功：{name}（{count} 个请求）"
+        if errors:
+            msg += "；部分字段未能完整映射"
+        self.status_msg(msg, 8000)
+
+    def _export_postman_to_file(self, nodes, default_name) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 Postman 集合", os.path.join(app_dir(), default_name), "Postman Collection (*.json);;JSON (*.json)"
+        )
+        if not path:
+            return
+        data = build_postman_collection(nodes, default_name)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.status_msg("已导出到 " + path, 8000)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    def export_postman(self) -> None:
+        sel = self._selected_node()
+        if sel:
+            target = sel[0]
+        else:
+            target = None
+        if target is not None and target.get("type") == "folder":
+            nodes = [target]
+            default_name = target.get("name", "集合")
+        else:
+            nodes = self.state.get("collections", [])
+            default_name = "HttpLite 集合"
+        if not nodes:
+            QMessageBox.information(self, "提示", "集合为空，暂无可导出的内容。")
+            return
+        self._export_postman_to_file(nodes, default_name)
+
+    def export_postman_request(self) -> None:
+        sel = self._selected_node()
+        if not sel or sel[0].get("type") != "request":
+            QMessageBox.information(self, "提示", "请先在集合中选中一个请求节点。")
+            return
+        self._export_postman_to_file([sel[0]], sel[0].get("name", "请求"))
+
+    def set_env_variable(self, key: str, value: str) -> None:
+        """把提取到的值写入当前环境变量（存在则更新，不存在则追加）。"""
+        env = self._current_env()
+        if env is None:
+            return
+        vars_ = env.setdefault("variables", [])
+        found = False
+        for v in vars_:
+            if v.get("key") == key:
+                v["value"] = value
+                v["enabled"] = True
+                found = True
+                break
+        if not found:
+            vars_.append({"key": key, "value": value, "enabled": True})
+        self._update_var_hint()
+        self._persist()
+
     def _ask_text(self, title, label, text):
         return QInputDialog.getText(self, title, label, text=text)
 
@@ -2520,6 +3348,88 @@ def run_self_test() -> None:
         lines.append("auth inject error: " + repr(e))
     ok = ok and auth_ok
 
+    # Postman 导入 / 导出 round-trip（纯逻辑）
+    try:
+        sample = {
+            "info": {"name": "Demo", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [
+                {
+                    "name": "Get User",
+                    "request": {
+                        "method": "GET",
+                        "url": {
+                            "raw": "https://httpbin.org/get?a=1",
+                            "host": ["https://httpbin.org"],
+                            "path": ["get"],
+                            "query": [{"key": "a", "value": "1"}],
+                        },
+                        "header": [{"key": "X-Token", "value": "abc"}],
+                        "body": {"mode": "raw", "raw": ""},
+                        "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "tok123", "type": "string"}]},
+                    },
+                },
+                {
+                    "name": "Sub",
+                    "item": [
+                        {
+                            "name": "Post JSON",
+                            "request": {
+                                "method": "POST",
+                                "url": "https://httpbin.org/post",
+                                "header": [],
+                                "body": {"mode": "raw", "raw": '{"k":1}', "options": {"raw": {"language": "json"}}},
+                                "auth": {"type": "noauth"},
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+        nodes, perr = parse_postman_collection(json.dumps(sample, ensure_ascii=False))
+        pm_ok = nodes is not None and len(nodes) == 1 and len(nodes[0]["children"]) == 2
+        pm_ok = pm_ok and nodes[0]["children"][1]["children"][0]["request"]["body_type"] == "JSON"
+        pm_ok = pm_ok and nodes[0]["children"][0]["request"]["auth"]["type"] == "bearer"
+        pm_ok = pm_ok and nodes[0]["children"][0]["request"]["params"] == [
+            {"key": "a", "value": "1", "enabled": True}
+        ]
+        exported = build_postman_collection(nodes, "Demo")
+        raw_ok = exported["item"][0]["item"][0]["request"]["url"]["raw"].endswith("?a=1")
+        nodes2, _ = parse_postman_collection(json.dumps(exported, ensure_ascii=False))
+        pm_ok = pm_ok and raw_ok and nodes2 is not None and nodes2[0]["children"][0]["request"]["params"] == [
+            {"key": "a", "value": "1", "enabled": True}
+        ]
+        lines.append("postman import/export: " + ("ok" if pm_ok else "FAIL " + ";".join(perr or [])))
+        ok = ok and pm_ok
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("postman error: " + repr(e))
+
+    # 断言与变量提取纯逻辑
+    try:
+        ctx = {
+            "status": 200,
+            "elapsed_ms": 350,
+            "text": '{"data":{"name":"HttpLite","tags":["a","b"]}}',
+            "json": {"data": {"name": "HttpLite", "tags": ["a", "b"]}},
+        }
+        r1, _ = evaluate_assertion("status_eq", "200", "", ctx)
+        r2, _ = evaluate_assertion("status_range", "2xx", "", ctx)
+        r3, _ = evaluate_assertion("time_lt", "500", "", ctx)
+        r4, _ = evaluate_assertion("body_contains", "HttpLite", "", ctx)
+        r5, _ = evaluate_assertion("json_exists", "$.data.name", "", ctx)
+        r6, _ = evaluate_assertion("json_eq", "$.data.tags[0]", "a", ctx)
+        r7, _ = evaluate_assertion("status_eq", "404", "", ctx)
+        ast_ok = r1 and r2 and r3 and r4 and r5 and r6 and (not r7)
+        ev1, v1 = run_extract("jsonpath", "$.data.name", ctx["text"], ctx["json"])
+        ev2, v2 = run_extract("regex", r'"name":\s*"([^"]+)"', ctx["text"], ctx["json"])
+        ext_ok = ev1 and v1 == "HttpLite" and ev2 and v2 == "HttpLite"
+        lines.append("assert runner: " + ("ok" if ast_ok else "FAIL"))
+        lines.append("extract runner: " + ("ok" if ext_ok else "FAIL"))
+        ok = ok and ast_ok and ext_ok
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("assert/extract error: " + repr(e))
+
     # UI 冒烟：多标签 / 主题 / 历史过滤（离屏）
     try:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -2545,6 +3455,19 @@ def run_self_test() -> None:
         win.hist_status.setCurrentIndex(1)  # 2xx
         flt_st = win.history_list.count()
         win._apply_theme("dark")
+        tab0 = win.current_tab()
+        tab0._add_assertion_row("status_eq", "200", "")
+        tab0._add_assertion_row("json_exists", "$.a", "")
+        tab0._add_extract_row("smoke_var", "jsonpath", "$.a.b")
+        win.set_env_variable("smoke_extract", "hello")
+        cur_env = win._current_env() or {}
+        smoke_env = any(
+            v.get("key") == "smoke_extract" and v.get("value") == "hello"
+            for v in cur_env.get("variables", [])
+        )
+        smoke_tests = tab0.tests_table.rowCount() == 2 and tab0.extract_table.rowCount() == 1
+        lines.append(f"ui tests tab: rows={tab0.tests_table.rowCount()}/{tab0.extract_table.rowCount()} env_extract={smoke_env}")
+        ok = ok and smoke_env and smoke_tests
         win.close()
         good_ui = (
             added == base + 2
@@ -2679,6 +3602,30 @@ def run_ui_shot(out_dir: str, theme_name: str = None) -> None:
             qapp.processEvents()
             saved = win.grab().save(os.path.join(out_dir, f"{theme}_history_filter.png"))
             lines.append(f"[{theme}] history_filter saved={saved} items={win.history_list.count()}")
+            # 测试 / 变量提取视图
+            tab = win._tabs[0]
+            tab.tests_table.setRowCount(0)
+            tab.extract_table.setRowCount(0)
+            tab._add_assertion_row("status_eq", "200", "")
+            tab._add_assertion_row("status_range", "2xx", "")
+            tab._add_assertion_row("time_lt", "800", "")
+            tab._add_assertion_row("body_contains", "success", "")
+            tab._add_assertion_row("json_exists", "$.data.token", "")
+            tab._add_assertion_row("json_eq", "$.data.role", "admin")
+            tab._add_extract_row("access_token", "jsonpath", "$.data.token")
+            tab._add_extract_row("user_id", "regex", r'"id":\s*(\d+)')
+            tab.last_response = {
+                "status_code": 200,
+                "reason": "OK",
+                "elapsed_ms": 312,
+                "size": 512,
+                "text": '{"data":{"token":"tk-9f2a","id":42,"role":"admin"}}',
+            }
+            tab.resp_tabs.setCurrentIndex(2)
+            tab._run_tests_and_extracts(tab.last_response)
+            qapp.processEvents()
+            saved = win.grab().save(os.path.join(out_dir, f"{theme}_tests.png"))
+            lines.append(f"[{theme}] tests saved={saved} rows={tab.tests_table.rowCount()}/{tab.extract_table.rowCount()}")
             win.close()
     except Exception as e:  # noqa: BLE001
         lines.append("ui-shot error: " + repr(e))
