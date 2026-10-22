@@ -182,7 +182,7 @@ def default_state() -> dict:
             },
         ],
         "active_env": "默认环境",
-        "settings": {"timeout": 30, "verify": True, "follow_redirects": True},
+        "settings": {"timeout": 30, "verify": True, "follow_redirects": True, "theme": "dark"},
     }
 
 
@@ -191,12 +191,13 @@ def load_state() -> dict:
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
             base = default_state()
             for k, v in base.items():
                 data.setdefault(k, v)
             return data
-        except Exception:
-            pass
     st = default_state()
     save_state(st)
     return st
@@ -611,128 +612,121 @@ def make_app_icon() -> QIcon:
 # JSON 语法高亮
 # --------------------------------------------------------------------------
 class JsonHighlighter(QSyntaxHighlighter):
-    def __init__(self, parent=None):
+    HL_COLORS = {
+        "dark": {"key": "#7ec8ff", "str": "#8ddb8a", "num": "#f0a45d", "kw": "#c792ea"},
+        "light": {"key": "#1a73e8", "str": "#188038", "num": "#b06000", "kw": "#7b1fa2"},
+    }
+
+    def __init__(self, parent=None, theme: str = "dark"):
         super().__init__(parent)
-        self.rules = []
+        self._theme = theme
+        self._build_formats()
 
+    def _build_formats(self) -> None:
+        c = self.HL_COLORS.get(self._theme, self.HL_COLORS["dark"])
         key_fmt = QTextCharFormat()
-        key_fmt.setForeground(QColor("#7ec8ff"))
+        key_fmt.setForeground(QColor(c["key"]))
         key_fmt.setFontWeight(QFont.Weight.Bold)
-
         str_fmt = QTextCharFormat()
-        str_fmt.setForeground(QColor("#8ddb8a"))
-
+        str_fmt.setForeground(QColor(c["str"]))
         num_fmt = QTextCharFormat()
-        num_fmt.setForeground(QColor("#f0a45d"))
-
+        num_fmt.setForeground(QColor(c["num"]))
         kw_fmt = QTextCharFormat()
-        kw_fmt.setForeground(QColor("#c792ea"))
+        kw_fmt.setForeground(QColor(c["kw"]))
         kw_fmt.setFontWeight(QFont.Weight.Bold)
+        self._rules = [
+            (QRegularExpression(r'"([^"\\]|\\.)*"(?=\s*:)'), key_fmt),
+            (QRegularExpression(r'"(?:[^"\\]|\\.)*"'), str_fmt),
+            (QRegularExpression(r"\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"), num_fmt),
+            (QRegularExpression(r"\b(?:true|false|null)\b"), kw_fmt),
+        ]
 
-        self.rules.append((QRegularExpression(r'"(?:[^"\\]|\\.)*"(?=\s*:)'), key_fmt))
-        self.rules.append((QRegularExpression(r'"(?:[^"\\]|\\.)*"'), str_fmt))
-        self.rules.append((QRegularExpression(r"\b-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"), num_fmt))
-        self.rules.append((QRegularExpression(r"\b(?:true|false|null)\b"), kw_fmt))
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+        self._build_formats()
+        self.rehighlight()
 
-    def highlightBlock(self, text: str) -> None:
-        for rx, fmt in self.rules:
-            it = rx.globalMatch(text)
+    def highlightBlock(self, text: str) -> None:  # noqa: N802
+        for pattern, fmt in self._rules:
+            it = pattern.globalMatch(text)
             while it.hasNext():
                 m = it.next()
                 self.setFormat(m.capturedStart(), m.capturedLength(), fmt)
 
 
 # --------------------------------------------------------------------------
-# 键值表（Params / Headers / form-data / 环境变量 复用）
+# 键值表（Query / Headers / form-data / urlencoded 共用）
 # --------------------------------------------------------------------------
 class KeyValueTable(QTableWidget):
-    def __init__(self, parent=None, key_label="键", value_label="值"):
-        super().__init__(0, 3, parent)
+    def __init__(self, key_label: str = "参数名", value_label: str = "参数值"):
+        super().__init__(0, 3)
+        self.key_label = key_label
+        self._loading = False
         self.setHorizontalHeaderLabels(["启用", key_label, value_label])
-        hh = self.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.Interactive)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
         self.setColumnWidth(0, 48)
         self.setColumnWidth(1, 220)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.verticalHeader().setVisible(False)
-        self.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_menu)
+        self.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.cellChanged.connect(self._on_cell_changed)
-        self._loading = False
+        self._auto_append = True
         self.add_row()
-
-    # -- 行操作 ------------------------------------------------------------
-    def add_row(self, key="", value="", enabled=True) -> int:
-        self._loading = True
-        r = self.rowCount()
-        self.insertRow(r)
-
-        it_en = QTableWidgetItem()
-        it_en.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        it_en.setCheckState(Qt.Checked if enabled else Qt.Unchecked)
-        self.setItem(r, 0, it_en)
-
-        self.setItem(r, 1, QTableWidgetItem(str(key or "")))
-        self.setItem(r, 2, QTableWidgetItem(str(value or "")))
-        self._loading = False
-        return r
-
-    def delete_selected(self) -> None:
-        rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
-        if not rows:
-            rows = [self.rowCount() - 1]
-        self._loading = True
-        for r in rows:
-            if 0 <= r < self.rowCount():
-                self.removeRow(r)
-        self._loading = False
-        if self.rowCount() == 0:
-            self.add_row()
-
-    def clear_all(self) -> None:
-        self._loading = True
-        self.setRowCount(0)
-        self._loading = False
-        self.add_row()
-
-    def _show_menu(self, pos) -> None:
-        menu = QMenu(self)
-        act_add = menu.addAction("新增一行")
-        act_del = menu.addAction("删除选中行")
-        menu.addSeparator()
-        act_clear = menu.addAction("清空")
-        chosen = menu.exec(self.viewport().mapToGlobal(pos))
-        if chosen == act_add:
-            self.add_row()
-        elif chosen == act_del:
-            self.delete_selected()
-        elif chosen == act_clear:
-            self.clear_all()
 
     def _on_cell_changed(self, row: int, col: int) -> None:
-        if self._loading:
+        if self._loading or not self._auto_append:
             return
-        last = self.rowCount() - 1
-        if row == last:
+        # 仅当最后一行已有内容时自动补一行（避免清空后无限增长）
+        if row == self.rowCount() - 1:
             k = self.item(row, 1)
             v = self.item(row, 2)
             if (k and k.text().strip()) or (v and v.text().strip()):
                 self.add_row()
 
-    # -- 数据 --------------------------------------------------------------
-    def pairs(self, with_enabled=False):
+    def add_row(self, key: str = "", value: str = "") -> None:
+        self._loading = True
+        try:
+            r = self.rowCount()
+            self.insertRow(r)
+            chk = QCheckBox()
+            chk.setChecked(True)
+            chk.setStyleSheet("margin-left:8px;")
+            self.setCellWidget(r, 0, chk)
+            self.setItem(r, 1, QTableWidgetItem(key))
+            self.setItem(r, 2, QTableWidgetItem(value))
+        finally:
+            self._loading = False
+
+    def delete_selected(self) -> None:
+        rows = sorted({i.row() for i in self.selectedItems()}, reverse=True)
+        if not rows:
+            rows = [self.rowCount() - 1]
+        self._loading = True
+        try:
+            for r in rows:
+                if 0 <= r < self.rowCount():
+                    self.removeRow(r)
+        finally:
+            self._loading = False
+        if self.rowCount() == 0:
+            self.add_row()
+
+    def clear_all(self) -> None:
+        self._auto_append = False
+        self.setRowCount(0)
+        self.add_row()
+        self._auto_append = True
+
+    def pairs(self, with_enabled: bool = False):
         out = []
         for r in range(self.rowCount()):
-            en_item = self.item(r, 0)
-            enabled = bool(en_item and en_item.checkState() == Qt.Checked)
+            w = self.cellWidget(r, 0)
+            enabled = not isinstance(w, QCheckBox) or w.isChecked()
             k_item = self.item(r, 1)
             v_item = self.item(r, 2)
-            key = k_item.text().strip() if k_item else ""
-            value = v_item.text() if v_item else ""
+            key = (k_item.text() if k_item else "").strip()
             if not key:
                 continue
+            value = v_item.text() if v_item else ""
             if with_enabled:
                 out.append({"key": key, "value": value, "enabled": enabled})
             elif enabled:
@@ -741,21 +735,29 @@ class KeyValueTable(QTableWidget):
 
     def set_pairs(self, pairs) -> None:
         self._loading = True
+        self._auto_append = False
         self.setRowCount(0)
-        self._loading = False
-        self.add_row()
-        for p in pairs or []:
+        for p in pairs:
             if isinstance(p, dict):
-                self.add_row(p.get("key", ""), p.get("value", ""), p.get("enabled", True))
+                key, value, enabled = p.get("key", ""), p.get("value", ""), p.get("enabled", True)
             else:
-                self.add_row(p[0], p[1], True)
-
-    def rename_headers(self, k_label: str, v_label: str) -> None:
-        self.setHorizontalHeaderLabels(["启用", k_label, v_label])
+                key, value, enabled = p[0], p[1], True
+            r = self.rowCount()
+            self.insertRow(r)
+            chk = QCheckBox()
+            chk.setChecked(bool(enabled))
+            chk.setStyleSheet("margin-left:8px;")
+            self.setCellWidget(r, 0, chk)
+            self.setItem(r, 1, QTableWidgetItem(key))
+            self.setItem(r, 2, QTableWidgetItem(value))
+        self._loading = False
+        self._auto_append = True
+        if self.rowCount() == 0:
+            self.add_row()
 
 
 # --------------------------------------------------------------------------
-# 请求线程
+# 网络请求线程
 # --------------------------------------------------------------------------
 class HttpWorker(QThread):
     done = Signal(dict)
@@ -763,57 +765,46 @@ class HttpWorker(QThread):
 
     def __init__(self, payload: dict, parent=None):
         super().__init__(parent)
-        self.payload = payload
+        self._payload = payload
 
-    def run(self) -> None:  # noqa: C901
-        p = self.payload
+    def run(self) -> None:  # noqa: D102
+        p = self._payload
         try:
-            t0 = time.perf_counter()
             kwargs = {
-                "method": p["method"],
-                "url": p["url"],
-                "headers": p.get("headers") or None,
+                "method": p.get("method", "GET"),
+                "url": p.get("url", ""),
+                "headers": p.get("headers") or {},
                 "params": p.get("params") or None,
                 "timeout": p.get("timeout", 30),
                 "verify": p.get("verify", True),
                 "allow_redirects": p.get("allow_redirects", True),
+                "auth": p.get("requests_auth"),
             }
-            if p.get("requests_auth") is not None:
-                kwargs["auth"] = p["requests_auth"]
             if p.get("files") is not None:
                 kwargs["files"] = p["files"]
-            elif p.get("data") is not None:
+            if p.get("data") is not None:
                 kwargs["data"] = p["data"]
-            elif p.get("json") is not None:
+            if p.get("json") is not None:
                 kwargs["json"] = p["json"]
-
+            t0 = time.perf_counter()
             resp = requests.request(**kwargs)
-            elapsed = (time.perf_counter() - t0) * 1000.0
-            content = resp.content or b""
-            try:
-                text = resp.text
-            except Exception:
-                text = repr(content)
-
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
             self.done.emit(
                 {
                     "status_code": resp.status_code,
-                    "reason": resp.reason or "",
+                    "reason": resp.reason,
                     "headers": list(resp.headers.items()),
-                    "text": text,
-                    "elapsed_ms": elapsed,
-                    "size": len(content),
+                    "text": resp.text,
+                    "elapsed_ms": elapsed_ms,
+                    "size": len(resp.content),
                     "final_url": resp.url,
-                    "redirects": [
-                        {"status": h.status_code, "url": h.url} for h in resp.history
-                    ],
+                    "redirects": len(resp.history),
                 }
             )
         except Exception as e:  # noqa: BLE001
-            msg = f"{type(e).__name__}: {e}"
-            low = msg.lower()
-            if "ssl" in low or "certificate" in low:
-                msg += "\n提示：可在工具栏勾选“忽略 SSL 证书”后重试。"
+            msg = str(e)
+            if "SSL" in type(e).__name__ or "ssl" in msg.lower():
+                msg += "\n提示：可尝试在选项区关闭「验证 SSL 证书」后重试。"
             self.failed.emit(msg)
 
 
@@ -821,187 +812,195 @@ class HttpWorker(QThread):
 # 环境管理对话框
 # --------------------------------------------------------------------------
 class EnvDialog(QDialog):
-    def __init__(self, environments: list, parent=None):
+    def __init__(self, envs: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("环境变量管理")
-        self.resize(760, 460)
-        self.envs = json.loads(json.dumps(environments or []))
-        if not self.envs:
-            self.envs = [{"name": "默认环境", "variables": []}]
-        self.current = 0
+        self.resize(720, 560)
+        self._envs = [dict(e) for e in envs]
+        lay = QVBoxLayout(self)
 
-        root = QVBoxLayout(self)
-        tip = QLabel("用法：在 URL / Headers / Body 中使用 {{变量名}}，发送时会按当前环境替换。")
-        tip.setStyleSheet("color:#9aa0a6;")
-        root.addWidget(tip)
-
-        body = QHBoxLayout()
-        root.addLayout(body, 1)
-
-        left = QVBoxLayout()
-        body.addLayout(left, 0)
-        self.list = QListWidget()
-        self.list.setFixedWidth(220)
-        self.list.currentRowChanged.connect(self._switch_env)
-        left.addWidget(self.list, 1)
+        self.env_list = QListWidget()
+        self.env_list.currentRowChanged.connect(self._on_row)
+        lay.addWidget(self.env_list, 1)
 
         btns = QHBoxLayout()
-        b_add = QPushButton("新建")
-        b_dup = QPushButton("复制")
+        b_add = QPushButton("新建环境")
+        b_add.clicked.connect(self._add_env)
+        b_copy = QPushButton("复制环境")
+        b_copy.clicked.connect(self._copy_env)
         b_ren = QPushButton("重命名")
-        b_del = QPushButton("删除")
-        for b in (b_add, b_dup, b_ren, b_del):
-            btns.addWidget(b)
-        left.addLayout(btns)
-        b_add.clicked.connect(self._new_env)
-        b_dup.clicked.connect(self._dup_env)
         b_ren.clicked.connect(self._rename_env)
-        b_del.clicked.connect(self._del_env)
+        b_del = QPushButton("删除环境")
+        b_del.clicked.connect(self._delete_env)
+        for b in (b_add, b_copy, b_ren, b_del):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        lay.addLayout(btns)
 
-        right = QVBoxLayout()
-        body.addLayout(right, 1)
-        right.addWidget(QLabel("变量列表（可取消勾选临时停用某个变量）"))
-        self.table = KeyValueTable()
-        right.addWidget(self.table, 1)
-        row = QHBoxLayout()
-        b_row_add = QPushButton("新增一行")
-        b_row_del = QPushButton("删除选中行")
-        row.addWidget(b_row_add)
-        row.addWidget(b_row_del)
-        row.addStretch(1)
-        right.addLayout(row)
-        b_row_add.clicked.connect(lambda: self.table.add_row())
-        b_row_del.clicked.connect(self.table.delete_selected)
+        self.vars_table = KeyValueTable("变量名", "变量值")
+        lay.addWidget(self.vars_table, 1)
+
+        self._name_lab = QLabel("")
+        lay.addWidget(self._name_lab)
+
+        self._refresh_list()
+        self._on_row(0)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self._on_ok)
+        bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        root.addWidget(bb)
+        lay.addWidget(bb)
 
-        self._reload_list()
+    def _refresh_list(self) -> None:
+        self.env_list.clear()
+        for e in self._envs:
+            self.env_list.addItem(e.get("name", "未命名"))
+        if self.env_list.count() == 0:
+            self.env_list.addItem("默认环境")
+            self._envs.append({"name": "默认环境", "variables": []})
+        self.env_list.setCurrentRow(0)
 
-    def _reload_list(self) -> None:
-        self.list.blockSignals(True)
-        self.list.clear()
-        for e in self.envs:
-            self.list.addItem(e.get("name", "未命名环境"))
-        self.list.blockSignals(False)
-        self.current = max(0, min(self.current, len(self.envs) - 1))
-        self.list.setCurrentRow(self.current)
-        self._load_env(self.current)
+    def _current_env(self):
+        row = self.env_list.currentRow()
+        if 0 <= row < len(self._envs):
+            return self._envs[row]
+        return None
 
-    def _sync(self) -> None:
-        if 0 <= self.current < len(self.envs):
-            self.envs[self.current]["variables"] = self.table.pairs(with_enabled=True)
+    def _save_row_vars(self) -> None:
+        env = self._current_env()
+        if env is not None:
+            env["variables"] = self.vars_table.pairs(with_enabled=True)
 
-    def _load_env(self, idx: int) -> None:
-        if not (0 <= idx < len(self.envs)):
+    def _on_row(self, row: int) -> None:
+        self._save_row_vars()
+        env = self._current_env()
+        if env is None:
             return
-        self.table.set_pairs(self.envs[idx].get("variables", []))
+        self._name_lab.setText("环境：%s" % env.get("name", ""))
+        self.vars_table.set_pairs(env.get("variables", []))
 
-    def _switch_env(self, idx: int) -> None:
-        if idx < 0 or idx == self.current:
+    def _add_env(self) -> None:
+        self._save_row_vars()
+        name, ok = QInputDialog.getText(self, "新建环境", "环境名称：", text="新环境")
+        if not ok or not name.strip():
             return
-        self._sync()
-        self.current = idx
-        self._load_env(idx)
+        name = name.strip()
+        if any(e.get("name") == name for e in self._envs):
+            QMessageBox.warning(self, "重名", "已存在同名环境。")
+            return
+        self._envs.append({"name": name, "variables": []})
+        self._refresh_list()
+        self.env_list.setCurrentRow(len(self._envs) - 1)
 
-    def _new_env(self) -> None:
-        self._sync()
-        self.envs.append({"name": f"环境{len(self.envs) + 1}", "variables": []})
-        self.current = len(self.envs) - 1
-        self._reload_list()
-
-    def _dup_env(self) -> None:
-        self._sync()
-        src = self.envs[self.current]
-        self.envs.append(
-            {
-                "name": src.get("name", "环境") + " 副本",
-                "variables": json.loads(json.dumps(src.get("variables", []))),
-            }
-        )
-        self.current = len(self.envs) - 1
-        self._reload_list()
+    def _copy_env(self) -> None:
+        env = self._current_env()
+        if env is None:
+            return
+        self._save_row_vars()
+        name = env.get("name", "新环境") + " 副本"
+        self._envs.append({"name": name, "variables": [dict(v) for v in env.get("variables", [])]})
+        self._refresh_list()
+        self.env_list.setCurrentRow(len(self._envs) - 1)
 
     def _rename_env(self) -> None:
-        name, ok = self._ask("重命名环境", "新的环境名称：", self.envs[self.current].get("name", ""))
+        env = self._current_env()
+        if env is None:
+            return
+        self._save_row_vars()
+        name, ok = QInputDialog.getText(self, "重命名", "新名称：", text=env.get("name", ""))
         if ok and name.strip():
-            self._sync()
-            self.envs[self.current]["name"] = name.strip()
-            self._reload_list()
+            env["name"] = name.strip()
+            self._refresh_list()
 
-    def _del_env(self) -> None:
-        if len(self.envs) <= 1:
-            QMessageBox.information(self, "提示", "至少需要保留一个环境。")
+    def _delete_env(self) -> None:
+        env = self._current_env()
+        if env is None:
             return
-        if QMessageBox.question(self, "确认", "确定删除当前环境？") != QMessageBox.Yes:
+        self._save_row_vars()
+        if QMessageBox.question(self, "确认", f"确定删除环境「{env.get('name')}」？") != QMessageBox.Yes:
             return
-        self.envs.pop(self.current)
-        self.current = max(0, self.current - 1)
-        self._reload_list()
-
-    def _ask(self, title, label, text):
-        return QInputDialog.getText(self, title, label, text=text)
-
-    def _on_ok(self) -> None:
-        self._sync()
-        for i, e in enumerate(self.envs):
-            if not e.get("name", "").strip():
-                e["name"] = f"环境{i + 1}"
-        self.accept()
+        self._envs.remove(env)
+        self._refresh_list()
 
     def result_data(self) -> list:
-        return self.envs
+        self._save_row_vars()
+        return self._envs
 
 
 # --------------------------------------------------------------------------
-# 主窗口
+# 主题配色（深色 / 浅色）
 # --------------------------------------------------------------------------
-class MainWindow(QMainWindow):
-    def __init__(self):
+THEME_COLORS = {
+    "dark": {
+        "hint": "#9aa0a6",
+        "muted": "#6b7075",
+        "preview": "#7ec8ff",
+        "chip_default_bg": "#2b2d31",
+        "chip_default_fg": "#c8ccd1",
+        "chip_busy_bg": "#2b2d31",
+        "chip_busy_fg": "#f0a45d",
+        "chip_err_bg": "#4a2222",
+        "chip_err_fg": "#f05f5f",
+    },
+    "light": {
+        "hint": "#5f6368",
+        "muted": "#80868b",
+        "preview": "#1a73e8",
+        "chip_default_bg": "#f1f3f4",
+        "chip_default_fg": "#5f6368",
+        "chip_busy_bg": "#fef7e8",
+        "chip_busy_fg": "#b06000",
+        "chip_err_bg": "#fdecea",
+        "chip_err_fg": "#d93025",
+    },
+}
+
+
+# --------------------------------------------------------------------------
+# 请求标签页（一个标签 = 一套完整的请求编辑上下文 + 独立响应区）
+# --------------------------------------------------------------------------
+class RequestTab(QWidget):
+    def __init__(self, main, initial: dict = None):
         super().__init__()
-        self.state = load_state()
+        self._main = main
+        self._theme = main.current_theme()
         self.worker = None
         self.last_response = None
-        self.current_request_id = None
         self.auth = default_auth()
         self._last_auth_notes = []
-
-        self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(make_app_icon())
-        self.resize(1320, 860)
-        self.setMinimumSize(1024, 660)
-
+        self.is_dirty = False
+        self._suppress_dirty = False
+        self._auth_bindings = []
+        self._auth_secret_widgets = []
+        self._auth_hints = []
         self._build_ui()
-        self._load_settings()
-        self._refresh_env_combo()
-        self._rebuild_history()
-        self._rebuild_collections()
-        self.status_msg("就绪。数据目录：" + DATA_DIR)
+        if initial:
+            self.apply_request(initial)
 
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
 
-        # ---- 顶部：方法 + URL + 发送 ----
+        # 顶部：方法 + URL + 发送 + 保存
         top = QHBoxLayout()
         top.setSpacing(6)
         self.method_combo = QComboBox()
         self.method_combo.addItems(METHODS)
         self.method_combo.setFixedWidth(112)
         self.method_combo.setStyleSheet("font-weight:600;")
+        self.method_combo.currentIndexChanged.connect(self._mark_dirty)
+        self.method_combo.currentIndexChanged.connect(self._notify_label_change)
         top.addWidget(self.method_combo)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("请输入请求地址，支持 {{变量}}，例如 {{base_url}}/api/login")
         self.url_edit.returnPressed.connect(self.send_request)
+        self.url_edit.textChanged.connect(self._mark_dirty)
+        self.url_edit.textChanged.connect(self._notify_label_change)
         top.addWidget(self.url_edit, 1)
 
         self.send_btn = QPushButton("发送")
@@ -1012,98 +1011,21 @@ class MainWindow(QMainWindow):
 
         self.save_btn = QPushButton("保存到集合")
         self.save_btn.setFixedWidth(110)
-        self.save_btn.clicked.connect(self.save_to_collection)
+        self.save_btn.clicked.connect(lambda: self._main.save_to_collection(self))
         top.addWidget(self.save_btn)
         root.addLayout(top)
 
-        # ---- 第二行：环境 / 选项 ----
-        opts = QHBoxLayout()
-        opts.setSpacing(8)
-        opts.addWidget(QLabel("环境："))
-        self.env_combo = QComboBox()
-        self.env_combo.setMinimumWidth(160)
-        self.env_combo.currentIndexChanged.connect(self._on_env_changed)
-        opts.addWidget(self.env_combo)
-        self.env_btn = QPushButton("管理环境")
-        self.env_btn.clicked.connect(self.manage_envs)
-        opts.addWidget(self.env_btn)
+        # 主体：请求详情 + 响应
+        split = QSplitter(Qt.Vertical)
+        root.addWidget(split, 1)
+        self.req_tabs = QTabWidget()
 
-        opts.addSpacing(12)
-        self.verify_chk = QCheckBox("忽略 SSL 证书")
-        opts.addWidget(self.verify_chk)
-        self.redirect_chk = QCheckBox("跟随重定向")
-        opts.addWidget(self.redirect_chk)
-        opts.addWidget(QLabel("超时(秒)："))
-        self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(1, 600)
-        self.timeout_spin.setFixedWidth(72)
-        opts.addWidget(self.timeout_spin)
-        opts.addStretch(1)
-        self.var_hint = QLabel("")
-        self.var_hint.setStyleSheet("color:#9aa0a6;")
-        opts.addWidget(self.var_hint)
-        root.addLayout(opts)
-
-        # ---- 主体：左（历史/集合）右（请求/响应） ----
-        main_split = QSplitter(Qt.Horizontal)
-        root.addWidget(main_split, 1)
-
-        left = QTabWidget()
-        left.setMinimumWidth(240)
-        left.setMaximumWidth(460)
-
-        # 历史
-        hist_wrap = QWidget()
-        hv = QVBoxLayout(hist_wrap)
-        hv.setContentsMargins(6, 6, 6, 6)
-        self.history_list = QListWidget()
-        self.history_list.itemDoubleClicked.connect(self._load_history_item)
-        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.history_list.customContextMenuRequested.connect(self._history_menu)
-        hv.addWidget(self.history_list, 1)
-        hb = QHBoxLayout()
-        h_clear = QPushButton("清空历史")
-        h_clear.clicked.connect(self.clear_history)
-        hb.addWidget(h_clear)
-        hb.addStretch(1)
-        hv.addLayout(hb)
-        left.addTab(hist_wrap, "历史记录")
-
-        # 集合
-        coll_wrap = QWidget()
-        cv = QVBoxLayout(coll_wrap)
-        cv.setContentsMargins(6, 6, 6, 6)
-        self.coll_tree = QTreeWidget()
-        self.coll_tree.setHeaderHidden(True)
-        self.coll_tree.itemDoubleClicked.connect(self._load_collection_item)
-        self.coll_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.coll_tree.customContextMenuRequested.connect(self._collection_menu)
-        cv.addWidget(self.coll_tree, 1)
-        cb = QHBoxLayout()
-        c_add_folder = QPushButton("新建文件夹")
-        c_add_folder.clicked.connect(self.new_collection_folder)
-        c_save = QPushButton("保存当前请求")
-        c_save.clicked.connect(self.save_to_collection)
-        cb.addWidget(c_add_folder)
-        cb.addWidget(c_save)
-        cv.addLayout(cb)
-        left.addTab(coll_wrap, "集合")
-
-        main_split.addWidget(left)
-
-        right_split = QSplitter(Qt.Vertical)
-        main_split.addWidget(right_split)
-        main_split.setSizes([300, 1020])
-
-        # 请求区
-        req_tabs = QTabWidget()
-        right_split.addWidget(req_tabs)
-
-        # Params
+        # ---- Query 参数 ----
         params_wrap = QWidget()
         pv = QVBoxLayout(params_wrap)
         pv.setContentsMargins(6, 6, 6, 6)
         self.params_table = KeyValueTable()
+        self.params_table.cellChanged.connect(self._mark_dirty)
         pv.addWidget(self.params_table, 1)
         pb = QHBoxLayout()
         p_add = QPushButton("新增一行")
@@ -1117,87 +1039,74 @@ class MainWindow(QMainWindow):
         pb.addWidget(p_import)
         pb.addStretch(1)
         pv.addLayout(pb)
-        req_tabs.addTab(params_wrap, "Query 参数")
+        self.req_tabs.addTab(params_wrap, "Query 参数")
 
-        # Authorization
+        # ---- Authorization ----
         auth_wrap = QWidget()
         av = QVBoxLayout(auth_wrap)
         av.setContentsMargins(6, 6, 6, 6)
-        av.setSpacing(6)
 
-        arow = QHBoxLayout()
-        arow.addWidget(QLabel("认证方式："))
+        at = QHBoxLayout()
+        at.addWidget(QLabel("认证类型："))
         self.auth_type = QComboBox()
         self.auth_type.addItems(AUTH_TYPE_LABELS)
         self.auth_type.setFixedWidth(200)
         self.auth_type.currentIndexChanged.connect(self._on_auth_type_changed)
-        arow.addWidget(self.auth_type)
+        at.addWidget(self.auth_type)
         self.auth_show_chk = QCheckBox("显示密钥")
         self.auth_show_chk.stateChanged.connect(self._toggle_auth_secret)
-        arow.addWidget(self.auth_show_chk)
-        arow.addStretch(1)
-        av.addLayout(arow)
+        at.addWidget(self.auth_show_chk)
+        at.addStretch(1)
+        av.addLayout(at)
 
         self.auth_stack = QStackedWidget()
-        self._auth_bindings = []
-        self._auth_secret_widgets = []
+        self.auth = default_auth()
 
-        def auth_page(rows, hint=""):
-            page = QWidget()
-            outer = QVBoxLayout(page)
-            outer.setContentsMargins(0, 4, 0, 0)
-            form = QFormLayout()
-            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-            for label, widget, path, secret in rows:
-                if isinstance(widget, (QLineEdit, QPlainTextEdit)):
-                    widget.setMinimumWidth(430)
-                if path:
-                    self._bind_auth(path, widget, secret=secret)
-                form.addRow(label, widget)
-            outer.addLayout(form)
+        def auth_page(fields, hint=""):
+            outer = QWidget()
+            fl = QFormLayout(outer)
+            fl.setContentsMargins(6, 6, 6, 6)
+            fl.setLabelAlignment(Qt.AlignRight)
+            for text, widget, path, secret in fields:
+                lab = QLabel(text)
+                fl.addRow(lab, widget)
+                self._bind_auth(path, widget, secret)
             if hint:
                 lab = QLabel(hint)
                 lab.setWordWrap(True)
-                lab.setStyleSheet("color:#9aa0a6;")
-                outer.addWidget(lab)
-            outer.addStretch(1)
-            self.auth_stack.addWidget(page)
+                lab.setStyleSheet(self._hint_style())
+                fl.addRow(lab)
+                self._auth_hints.append(lab)
+            self.auth_stack.addWidget(outer)
 
         # 0 无认证
-        auth_page([], "该请求不携带任何认证信息。")
+        none_page = QLabel("不使用认证信息。")
+        none_page.setAlignment(Qt.AlignCenter)
+        none_page.setStyleSheet(self._muted_style())
+        self.auth_stack.addWidget(none_page)
 
-        # 1 Bearer Token
+        # 1 Bearer
         self.auth_bearer_token = QLineEdit()
-        self.auth_bearer_token.setPlaceholderText("例如 {{token}}，或直接粘贴 Access Token")
-        auth_page(
-            [("Token：", self.auth_bearer_token, "bearer.token", True)],
-            "发送时自动添加请求头：Authorization: Bearer <Token>",
-        )
+        self.auth_bearer_token.setPlaceholderText("如 {{token}}")
+        auth_page([("Token：", self.auth_bearer_token, "bearer.token", True)], "自动写入 Authorization: Bearer <token>。")
 
-        # 2 Basic Auth
+        # 2 Basic
         self.auth_basic_user = QLineEdit()
         self.auth_basic_user.setPlaceholderText("用户名")
         self.auth_basic_pwd = QLineEdit()
         self.auth_basic_pwd.setPlaceholderText("密码")
         auth_page(
-            [
-                ("用户名：", self.auth_basic_user, "basic.username", False),
-                ("密码：", self.auth_basic_pwd, "basic.password", True),
-            ],
-            "以 HTTP Basic 方式发送（Authorization: Basic base64(用户名:密码)）。",
+            [("用户名：", self.auth_basic_user, "basic.username", False), ("密码：", self.auth_basic_pwd, "basic.password", True)],
+            "使用 HTTP Basic 认证，由 requests 自动生成 Authorization 头。",
         )
 
-        # 3 Digest Auth
+        # 3 Digest
         self.auth_digest_user = QLineEdit()
         self.auth_digest_user.setPlaceholderText("用户名")
         self.auth_digest_pwd = QLineEdit()
         self.auth_digest_pwd.setPlaceholderText("密码")
         auth_page(
-            [
-                ("用户名：", self.auth_digest_user, "digest.username", False),
-                ("密码：", self.auth_digest_pwd, "digest.password", True),
-            ],
+            [("用户名：", self.auth_digest_user, "digest.username", False), ("密码：", self.auth_digest_pwd, "digest.password", True)],
             "HTTP Digest 摘要认证：首次请求收到 401 挑战后，自动按服务器 nonce 重发。",
         )
 
@@ -1210,11 +1119,7 @@ class MainWindow(QMainWindow):
         self.auth_apikey_in.addItem("Header", "header")
         self.auth_apikey_in.addItem("Query 参数", "query")
         auth_page(
-            [
-                ("Key 名称：", self.auth_apikey_key, "apikey.key", False),
-                ("Value：", self.auth_apikey_value, "apikey.value", True),
-                ("添加到：", self.auth_apikey_in, "apikey.in", False),
-            ],
+            [("Key 名称：", self.auth_apikey_key, "apikey.key", False), ("Value：", self.auth_apikey_value, "apikey.value", True), ("添加到：", self.auth_apikey_in, "apikey.in", False)],
             "把 Key/Value 作为请求头或查询参数附加到请求上。",
         )
 
@@ -1270,21 +1175,22 @@ class MainWindow(QMainWindow):
 
         self.auth_preview = QLabel("不使用认证信息。")
         self.auth_preview.setWordWrap(True)
-        self.auth_preview.setStyleSheet("color:#7ec8ff; padding:2px 0;")
+        self.auth_preview.setStyleSheet(self._preview_style())
         av.addWidget(self.auth_preview)
         av.addStretch(1)
-        req_tabs.addTab(auth_wrap, "Authorization")
+        self.req_tabs.addTab(auth_wrap, "Authorization")
 
         # 认证预览跟随地址 / 方法 / 环境变化
         self.url_edit.textChanged.connect(self._on_auth_changed)
         self.method_combo.currentIndexChanged.connect(self._on_auth_changed)
-        self.env_combo.currentIndexChanged.connect(self._on_auth_changed)
+        self._main.env_combo.currentIndexChanged.connect(self.refresh_auth_preview)
 
-        # Headers
+        # ---- Headers ----
         head_wrap = QWidget()
         hv2 = QVBoxLayout(head_wrap)
         hv2.setContentsMargins(6, 6, 6, 6)
         self.headers_table = KeyValueTable()
+        self.headers_table.cellChanged.connect(self._mark_dirty)
         hv2.addWidget(self.headers_table, 1)
         hb2 = QHBoxLayout()
         h_add = QPushButton("新增一行")
@@ -1298,9 +1204,9 @@ class MainWindow(QMainWindow):
         hb2.addWidget(h_preset)
         hb2.addStretch(1)
         hv2.addLayout(hb2)
-        req_tabs.addTab(head_wrap, "Headers")
+        self.req_tabs.addTab(head_wrap, "Headers")
 
-        # Body
+        # ---- Body ----
         body_wrap = QWidget()
         bv = QVBoxLayout(body_wrap)
         bv.setContentsMargins(6, 6, 6, 6)
@@ -1310,12 +1216,13 @@ class MainWindow(QMainWindow):
         self.body_type.addItems(["none", "JSON", "form-data", "x-www-form-urlencoded"])
         self.body_type.setFixedWidth(210)
         self.body_type.currentIndexChanged.connect(self._on_body_type_changed)
+        self.body_type.currentIndexChanged.connect(self._mark_dirty)
         bt.addWidget(self.body_type)
         self.fmt_btn = QPushButton("格式化 JSON")
         self.fmt_btn.clicked.connect(self.format_json_body)
         bt.addWidget(self.fmt_btn)
         self.body_hint = QLabel("")
-        self.body_hint.setStyleSheet("color:#9aa0a6;")
+        self.body_hint.setStyleSheet(self._hint_style())
         bt.addWidget(self.body_hint)
         bt.addStretch(1)
         bv.addLayout(bt)
@@ -1325,23 +1232,26 @@ class MainWindow(QMainWindow):
 
         none_page = QLabel("该请求不携带 Body。")
         none_page.setAlignment(Qt.AlignCenter)
-        none_page.setStyleSheet("color:#6b7075;")
+        none_page.setStyleSheet(self._muted_style())
         self.body_stack.addWidget(none_page)
 
         self.body_json = QPlainTextEdit()
         self.body_json.setPlaceholderText('{\n    "key": "value"\n}')
         self.body_json.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.json_hl = JsonHighlighter(self.body_json.document())
+        self.body_json.textChanged.connect(self._mark_dirty)
+        self.json_hl = JsonHighlighter(self.body_json.document(), self._theme)
         self.body_stack.addWidget(self.body_json)
 
         self.body_form = KeyValueTable(key_label="字段名")
+        self.body_form.cellChanged.connect(self._mark_dirty)
         self.body_stack.addWidget(self.body_form)
 
         self.body_urlenc = KeyValueTable(key_label="字段名")
+        self.body_urlenc.cellChanged.connect(self._mark_dirty)
         self.body_stack.addWidget(self.body_urlenc)
-        req_tabs.addTab(body_wrap, "Body")
+        self.req_tabs.addTab(body_wrap, "Body")
 
-        # 响应区
+        # ---- 响应区 ----
         resp_wrap = QWidget()
         rv = QVBoxLayout(resp_wrap)
         rv.setContentsMargins(6, 6, 6, 6)
@@ -1350,9 +1260,7 @@ class MainWindow(QMainWindow):
         rbar = QHBoxLayout()
         self.status_label = QLabel("尚未发送请求")
         self.status_label.setObjectName("statusChip")
-        self.status_label.setStyleSheet(
-            "background:#2b2d31; color:#c8ccd1; padding:4px 12px; border-radius:10px; font-weight:600;"
-        )
+        self._set_status_chip("尚未发送请求", "default")
         rbar.addWidget(self.status_label)
         self.time_label = QLabel("耗时：-")
         self.size_label = QLabel("大小：-")
@@ -1375,7 +1283,7 @@ class MainWindow(QMainWindow):
         self.resp_body = QPlainTextEdit()
         self.resp_body.setReadOnly(True)
         self.resp_body.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.resp_hl = JsonHighlighter(self.resp_body.document())
+        self.resp_hl = JsonHighlighter(self.resp_body.document(), self._theme)
         self.resp_tabs.addTab(self.resp_body, "响应体")
         self.resp_headers = QTableWidget(0, 2)
         self.resp_headers.setHorizontalHeaderLabels(["响应头", "值"])
@@ -1386,25 +1294,67 @@ class MainWindow(QMainWindow):
         self.resp_headers.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.resp_tabs.addTab(self.resp_headers, "响应头")
         rv.addWidget(self.resp_tabs, 1)
-        right_split.addWidget(resp_wrap)
-        right_split.setSizes([420, 420])
-
-        self.statusBar().showMessage("就绪")
-        self._shortcuts = []
-        for seq, slot in (
-            ("Ctrl+Return", self.send_request),
-            ("Ctrl+Enter", self.send_request),
-            ("Ctrl+S", self.save_to_collection),
-        ):
-            sc = QShortcut(QKeySequence(seq), self)
-            sc.activated.connect(slot)
-            self._shortcuts.append(sc)
+        split.addWidget(self.req_tabs)
+        split.addWidget(resp_wrap)
+        split.setSizes([420, 420])
 
     # ------------------------------------------------------------------
-    # 基础辅助
+    # 主题 / 样式辅助
     # ------------------------------------------------------------------
-    def status_msg(self, text: str, ms: int = 4000) -> None:
-        self.statusBar().showMessage(text, ms)
+    def _hint_style(self) -> str:
+        return f"color:{THEME_COLORS[self._theme]['hint']};"
+
+    def _muted_style(self) -> str:
+        return f"color:{THEME_COLORS[self._theme]['muted']};"
+
+    def _preview_style(self) -> str:
+        return f"color:{THEME_COLORS[self._theme]['preview']}; padding:2px 0;"
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+        self.json_hl.set_theme(theme)
+        self.resp_hl.set_theme(theme)
+        for lab in self._auth_hints:
+            lab.setStyleSheet(self._hint_style())
+        self.body_hint.setStyleSheet(self._hint_style())
+        self.auth_preview.setStyleSheet(self._preview_style())
+        for i in range(self.body_stack.count()):
+            w = self.body_stack.widget(i)
+            if isinstance(w, QLabel) and not w.text().strip().startswith("{"):
+                w.setStyleSheet(self._muted_style())
+        if self.status_label.text() == "尚未发送请求":
+            self._set_status_chip("尚未发送请求", "default")
+
+    def refresh_auth_preview(self, *_args) -> None:
+        self._on_auth_changed()
+
+    def _set_status_chip(self, text: str, kind: str = "default") -> None:
+        c = THEME_COLORS[self._theme]
+        if kind == "busy":
+            bg, fg = c["chip_busy_bg"], c["chip_busy_fg"]
+        elif kind == "err":
+            bg, fg = c["chip_err_bg"], c["chip_err_fg"]
+        else:
+            bg, fg = c["chip_default_bg"], c["chip_default_fg"]
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"background:{bg}; color:{fg}; padding:4px 12px; border-radius:10px; font-weight:600;"
+        )
+
+    def _set_status_chip_color(self, color: str) -> None:
+        self.status_label.setStyleSheet(
+            f"background:{color}33; color:{color}; padding:4px 12px; border-radius:10px; font-weight:700;"
+        )
+
+    # ------------------------------------------------------------------
+    # 标签脏标记
+    # ------------------------------------------------------------------
+    def _mark_dirty(self, *_args) -> None:
+        if not self._suppress_dirty:
+            self.is_dirty = True
+
+    def _notify_label_change(self, *_args) -> None:
+        self._main._update_tab_label(self)
 
     # ------------------------------------------------------------------
     # 认证面板
@@ -1420,6 +1370,7 @@ class MainWindow(QMainWindow):
             widget.textChanged.connect(self._on_auth_changed)
         else:
             widget.textChanged.connect(self._on_auth_changed)
+        widget.textChanged.connect(self._mark_dirty) if not isinstance(widget, QComboBox) else None
 
     def _toggle_auth_secret(self) -> None:
         show = self.auth_show_chk.isChecked()
@@ -1431,6 +1382,7 @@ class MainWindow(QMainWindow):
         if 0 <= index < self.auth_stack.count():
             self.auth_stack.setCurrentIndex(index)
         self._on_auth_changed()
+        self._mark_dirty()
 
     def _on_auth_changed(self, *_args) -> None:
         self._sync_auth_from_ui()
@@ -1497,7 +1449,7 @@ class MainWindow(QMainWindow):
             return
         probe = {
             "method": self.method_combo.currentText(),
-            "url": substitute(self.url_edit.text().strip(), self.variables()),
+            "url": substitute(self.url_edit.text().strip(), self._main.variables()),
             "headers": {},
             "params": [],
             "data": None,
@@ -1506,79 +1458,11 @@ class MainWindow(QMainWindow):
             "requests_auth": None,
         }
         try:
-            notes = apply_auth(probe, auth, self.variables())
+            notes = apply_auth(probe, auth, self._main.variables())
         except Exception as e:  # noqa: BLE001
             self.auth_preview.setText("认证预览失败：" + str(e))
             return
         self.auth_preview.setText("预览 → " + ("；".join(notes) if notes else "无变化"))
-
-    def _settings(self) -> dict:
-        return self.state.setdefault("settings", {})
-
-    def _load_settings(self) -> None:
-        s = self._settings()
-        self.timeout_spin.setValue(int(s.get("timeout", 30)))
-        self.verify_chk.setChecked(not bool(s.get("verify", True)))
-        self.redirect_chk.setChecked(bool(s.get("follow_redirects", True)))
-
-    def _save_settings(self) -> None:
-        s = self._settings()
-        s["timeout"] = self.timeout_spin.value()
-        s["verify"] = not self.verify_chk.isChecked()
-        s["follow_redirects"] = self.redirect_chk.isChecked()
-
-    def _current_env(self) -> dict:
-        name = self.state.get("active_env")
-        for e in self.state.get("environments", []):
-            if e.get("name") == name:
-                return e
-        envs = self.state.get("environments", [])
-        return envs[0] if envs else {"name": "默认环境", "variables": []}
-
-    def variables(self) -> dict:
-        env = self._current_env()
-        out = {}
-        for v in env.get("variables", []):
-            if v.get("enabled", True) and v.get("key"):
-                out[v["key"]] = v.get("value", "")
-        return out
-
-    def _refresh_env_combo(self) -> None:
-        self.env_combo.blockSignals(True)
-        self.env_combo.clear()
-        names = [e.get("name", "") for e in self.state.get("environments", [])]
-        self.env_combo.addItems(names)
-        active = self.state.get("active_env")
-        if active in names:
-            self.env_combo.setCurrentIndex(names.index(active))
-        self.env_combo.blockSignals(False)
-        self._update_var_hint()
-
-    def _on_env_changed(self, idx: int) -> None:
-        names = [e.get("name", "") for e in self.state.get("environments", [])]
-        if 0 <= idx < len(names):
-            self.state["active_env"] = names[idx]
-            save_state(self.state)
-            self._update_var_hint()
-
-    def _update_var_hint(self) -> None:
-        env = self._current_env()
-        n = len([v for v in env.get("variables", []) if v.get("enabled", True) and v.get("key")])
-        self.var_hint.setText(f"当前环境「{env.get('name', '')}」已加载 {n} 个变量")
-
-    # ------------------------------------------------------------------
-    # 环境管理
-    # ------------------------------------------------------------------
-    def manage_envs(self) -> None:
-        dlg = EnvDialog(self.state.get("environments", []), self)
-        if dlg.exec() == QDialog.Accepted:
-            self.state["environments"] = dlg.result_data()
-            names = [e.get("name") for e in self.state["environments"]]
-            if self.state.get("active_env") not in names:
-                self.state["active_env"] = names[0]
-            save_state(self.state)
-            self._refresh_env_combo()
-            self.status_msg("环境变量已更新")
 
     # ------------------------------------------------------------------
     # Body 类型切换
@@ -1623,7 +1507,7 @@ class MainWindow(QMainWindow):
     def import_url_params(self) -> None:
         url = self.url_edit.text().strip()
         if "?" not in url:
-            self.status_msg("URL 中没有查询参数")
+            self._main.status_msg("URL 中没有查询参数")
             return
         base, _, query = url.partition("?")
         self.url_edit.setText(base)
@@ -1631,13 +1515,13 @@ class MainWindow(QMainWindow):
         for k, v in parse_qsl(query, keep_blank_values=True):
             self.params_table.add_row(k, v)
             count += 1
-        self.status_msg(f"已从 URL 导入 {count} 个查询参数")
+        self._main.status_msg(f"已从 URL 导入 {count} 个查询参数")
 
     # ------------------------------------------------------------------
     # 发送请求
     # ------------------------------------------------------------------
     def _collect_request(self) -> dict:
-        variables = self.variables()
+        variables = self._main.variables()
         method = self.method_combo.currentText()
         raw_url = self.url_edit.text().strip()
         url = substitute(raw_url, variables).strip()
@@ -1656,9 +1540,9 @@ class MainWindow(QMainWindow):
             "url": url,
             "headers": headers,
             "params": params or None,
-            "timeout": self.timeout_spin.value(),
-            "verify": not self.verify_chk.isChecked(),
-            "allow_redirects": self.redirect_chk.isChecked(),
+            "timeout": self._main.timeout_spin.value(),
+            "verify": not self._main.verify_chk.isChecked(),
+            "allow_redirects": self._main.redirect_chk.isChecked(),
             "data": None,
             "files": None,
             "json": None,
@@ -1698,23 +1582,20 @@ class MainWindow(QMainWindow):
 
     def send_request(self) -> None:
         if self.worker is not None and self.worker.isRunning():
-            self.status_msg("已有请求正在进行中…")
+            self._main.status_msg("已有请求正在进行中…")
             return
         payload = self._collect_request()
         if not payload["url"]:
             QMessageBox.information(self, "提示", "请先输入请求地址。")
             return
         if "{{" in payload["url"]:
-            self.status_msg("警告：URL 中仍存在未解析的变量")
+            self._main.status_msg("警告：URL 中仍存在未解析的变量")
 
         self.send_btn.setEnabled(False)
         self.send_btn.setText("请求中")
-        self.status_label.setText("请求中…")
-        self.status_label.setStyleSheet(
-            "background:#2b2d31; color:#f0a45d; padding:4px 12px; border-radius:10px; font-weight:600;"
-        )
-        self._save_settings()
-        save_state(self.state)
+        self._set_status_chip("请求中…", "busy")
+        self._main._save_settings()
+        self._main._persist()
 
         self._last_auth_notes = list(payload.get("_auth_notes") or [])
         self.worker = HttpWorker(payload, self)
@@ -1729,25 +1610,20 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, message: str) -> None:
         self.last_response = None
-        self.status_label.setText("请求失败")
-        self.status_label.setStyleSheet(
-            "background:#4a2222; color:#f05f5f; padding:4px 12px; border-radius:10px; font-weight:600;"
-        )
+        self._set_status_chip("请求失败", "err")
         self.time_label.setText("耗时：-")
         self.size_label.setText("大小：-")
         self.resp_body.setPlainText(message)
         self.resp_headers.setRowCount(0)
-        self._add_history(self._collect_request(), error=message)
-        self.status_msg("请求失败：" + message.splitlines()[0] + self._auth_note_suffix(), 10000)
+        self._main._add_history(self.snapshot(), error=message)
+        self._main.status_msg("请求失败：" + message.splitlines()[0] + self._auth_note_suffix(), 10000)
 
     def _on_response(self, data: dict) -> None:
         self.last_response = data
         code = data["status_code"]
         color = STATUS_COLORS.get(str(code)[0], "#8d949c")
         self.status_label.setText(f"{code} {data.get('reason', '')}".strip())
-        self.status_label.setStyleSheet(
-            f"background:{color}22; color:{color}; padding:4px 12px; border-radius:10px; font-weight:700;"
-        )
+        self._set_status_chip_color(color)
         self.time_label.setText(f"耗时：{fmt_ms(data['elapsed_ms'])}")
         self.size_label.setText(f"大小：{fmt_size(data['size'])}")
         self._render_response_body()
@@ -1758,8 +1634,8 @@ class MainWindow(QMainWindow):
             self.resp_headers.setItem(i, 0, QTableWidgetItem(str(k)))
             self.resp_headers.setItem(i, 1, QTableWidgetItem(str(v)))
 
-        self._add_history(self._collect_request(), status=code)
-        self.status_msg(
+        self._main._add_history(self.snapshot(), status=code)
+        self._main.status_msg(
             f"请求完成：{code} · {fmt_ms(data['elapsed_ms'])} · {fmt_size(data['size'])}"
             + self._auth_note_suffix(),
             8000,
@@ -1783,14 +1659,14 @@ class MainWindow(QMainWindow):
 
     def copy_response(self) -> None:
         if not self.last_response:
-            self.status_msg("暂无响应内容可复制")
+            self._main.status_msg("暂无响应内容可复制")
             return
         QApplication.clipboard().setText(self.last_response.get("text", ""))
-        self.status_msg("响应内容已复制到剪贴板")
+        self._main.status_msg("响应内容已复制到剪贴板")
 
     def save_response(self) -> None:
         if not self.last_response:
-            self.status_msg("暂无响应内容可保存")
+            self._main.status_msg("暂无响应内容可保存")
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "保存响应内容", os.path.join(app_dir(), "response.txt"), "文本文件 (*.txt);;JSON (*.json);;所有文件 (*)"
@@ -1800,29 +1676,14 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.last_response.get("text", ""))
-            self.status_msg("响应已保存到 " + path)
+            self._main.status_msg("响应已保存到 " + path)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "保存失败", str(e))
 
     # ------------------------------------------------------------------
-    # 历史记录
+    # 请求快照 / 载入
     # ------------------------------------------------------------------
-    def _add_history(self, req: dict, status=None, error=None) -> None:
-        entry = {
-            "method": req.get("method", "GET"),
-            "url": req.get("_raw_url") or req.get("url", ""),
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "status": status,
-            "error": error,
-            "request": self._request_snapshot(),
-        }
-        hist = self.state.setdefault("history", [])
-        hist.insert(0, entry)
-        del hist[300:]
-        save_state(self.state)
-        self._rebuild_history()
-
-    def _request_snapshot(self) -> dict:
+    def snapshot(self) -> dict:
         return {
             "method": self.method_combo.currentText(),
             "url": self.url_edit.text(),
@@ -1835,11 +1696,486 @@ class MainWindow(QMainWindow):
             "auth": self.auth_snapshot(),
         }
 
+    def apply_request(self, req: dict) -> None:
+        if not req:
+            return
+        self._suppress_dirty = True
+        try:
+            method = req.get("method", "GET")
+            if method in METHODS:
+                self.method_combo.setCurrentText(method)
+            self.url_edit.setText(req.get("url", ""))
+            self.params_table.set_pairs(req.get("params", []))
+            self.headers_table.set_pairs(req.get("headers", []))
+            btype = req.get("body_type", "none")
+            idx = {"none": 0, "JSON": 1, "form-data": 2, "x-www-form-urlencoded": 3}.get(btype, 0)
+            self.body_type.setCurrentIndex(idx)
+            self.body_stack.setCurrentIndex(idx)
+            self.body_json.setPlainText(req.get("body_json", ""))
+            self.body_form.set_pairs(req.get("body_form", []))
+            self.body_urlenc.set_pairs(req.get("body_urlenc", []))
+            self.set_auth(req.get("auth"))
+        finally:
+            self._suppress_dirty = False
+        self.is_dirty = False
+        self._notify_label_change()
+
+# --------------------------------------------------------------------------
+# 主题样式表
+# --------------------------------------------------------------------------
+THEMES = {
+    "dark": """
+QWidget { font-family: "Microsoft YaHei UI","Segoe UI",sans-serif; font-size: 12px; }
+QMainWindow, QDialog { background: #1b1c1f; }
+QWidget { color: #d7dae0; }
+QLineEdit, QPlainTextEdit, QTableWidget, QListWidget, QTreeWidget, QComboBox, QSpinBox {
+    background: #24262a; border: 1px solid #34373d; border-radius: 6px;
+    selection-background-color: #3a6ea5; selection-color: #ffffff;
+}
+QLineEdit { padding: 6px 8px; }
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #ff8b3d; }
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView { background: #24262a; border: 1px solid #34373d; }
+QPlainTextEdit { padding: 6px; }
+QPushButton {
+    background: #2d3035; border: 1px solid #3a3e44; border-radius: 6px;
+    padding: 6px 12px; color: #dfe2e6;
+}
+QPushButton:hover { background: #363a41; border-color: #4a4f57; }
+QPushButton:pressed { background: #24262a; }
+QPushButton#primary { background: #ff6f3c; border: none; color: #ffffff; font-weight: 700; }
+QPushButton#primary:hover { background: #ff8253; }
+QPushButton#primary:disabled { background: #5a4034; color: #b9a79f; }
+QTabWidget::pane { border: 1px solid #2c2f34; border-radius: 8px; top: -1px; }
+QTabBar::tab {
+    background: transparent; color: #9aa0a6; padding: 7px 14px;
+    border: 1px solid transparent; border-top-left-radius: 6px; border-top-right-radius: 6px;
+}
+QTabBar::tab:selected { background: #24262a; color: #ffffff; border-color: #2c2f34; }
+QTabBar::tab:hover { color: #e6e8ea; }
+QHeaderView::section {
+    background: #24262a; color: #9aa0a6; padding: 5px 6px; border: none;
+    border-right: 1px solid #2c2f34; border-bottom: 1px solid #2c2f34;
+}
+QTableWidget { gridline-color: #2c2f34; }
+QListWidget::item, QTreeWidget::item { padding: 4px 6px; border-radius: 4px; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: #3a6ea5; color: #ffffff; }
+QSplitter::handle { background: #2c2f34; }
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+QCheckBox { spacing: 6px; }
+QStatusBar { color: #8d949c; }
+QScrollBar:vertical { background: #1b1c1f; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #3a3e44; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #4a4f57; }
+QScrollBar:horizontal { background: #1b1c1f; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #3a3e44; border-radius: 5px; min-width: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QMenu { background: #24262a; border: 1px solid #34373d; padding: 4px; }
+QMenu::item { padding: 6px 20px; border-radius: 4px; }
+QMenu::item:selected { background: #3a6ea5; }
+""",
+    "light": """
+QWidget { font-family: "Microsoft YaHei UI","Segoe UI",sans-serif; font-size: 12px; }
+QMainWindow, QDialog { background: #f7f8fa; }
+QWidget { color: #202124; }
+QLineEdit, QPlainTextEdit, QTableWidget, QListWidget, QTreeWidget, QComboBox, QSpinBox {
+    background: #ffffff; border: 1px solid #dadce0; border-radius: 6px;
+    selection-background-color: #1a73e8; selection-color: #ffffff;
+}
+QLineEdit { padding: 6px 8px; }
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #ff8b3d; }
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #dadce0; }
+QPlainTextEdit { padding: 6px; }
+QPushButton {
+    background: #ffffff; border: 1px solid #dadce0; border-radius: 6px;
+    padding: 6px 12px; color: #202124;
+}
+QPushButton:hover { background: #f1f3f4; border-color: #c6c9cd; }
+QPushButton:pressed { background: #e8eaed; }
+QPushButton#primary { background: #ff6f3c; border: none; color: #ffffff; font-weight: 700; }
+QPushButton#primary:hover { background: #ff8253; }
+QPushButton#primary:disabled { background: #e8c9ba; color: #ffffff; }
+QTabWidget::pane { border: 1px solid #dadce0; border-radius: 8px; top: -1px; }
+QTabBar::tab {
+    background: transparent; color: #5f6368; padding: 7px 14px;
+    border: 1px solid transparent; border-top-left-radius: 6px; border-top-right-radius: 6px;
+}
+QTabBar::tab:selected { background: #ffffff; color: #202124; border-color: #dadce0; }
+QTabBar::tab:hover { color: #202124; }
+QHeaderView::section {
+    background: #f1f3f4; color: #5f6368; padding: 5px 6px; border: none;
+    border-right: 1px solid #dadce0; border-bottom: 1px solid #dadce0;
+}
+QTableWidget { gridline-color: #e8eaed; }
+QListWidget::item, QTreeWidget::item { padding: 4px 6px; border-radius: 4px; }
+QListWidget::item:selected, QTreeWidget::item:selected { background: #1a73e8; color: #ffffff; }
+QSplitter::handle { background: #dadce0; }
+QSplitter::handle:horizontal { width: 4px; }
+QSplitter::handle:vertical { height: 4px; }
+QCheckBox { spacing: 6px; }
+QStatusBar { color: #5f6368; }
+QScrollBar:vertical { background: #f7f8fa; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #c6c9cd; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #aeb2b8; }
+QScrollBar:horizontal { background: #f7f8fa; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: #c6c9cd; border-radius: 5px; min-width: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QMenu { background: #ffffff; border: 1px solid #dadce0; padding: 4px; }
+QMenu::item { padding: 6px 20px; border-radius: 4px; }
+QMenu::item:selected { background: #1a73e8; }
+""",
+}
+
+
+# --------------------------------------------------------------------------
+# 主窗口
+# --------------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.state = load_state()
+        self._tabs = []
+        self._theme = "dark"
+        self._shortcuts = []
+        self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(make_app_icon())
+        self.resize(1320, 860)
+        self.setMinimumSize(1024, 660)
+        self._build_ui()
+        self._load_settings()
+        self._refresh_env_combo()
+        self._rebuild_history()
+        self._rebuild_collections()
+        self._new_request_tab()
+        self.status_msg("就绪。数据目录：" + DATA_DIR)
+
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 4)
+        root.setSpacing(6)
+
+        # 全局选项行（环境 / 证书 / 重定向 / 超时）
+        opts = QHBoxLayout()
+        opts.setSpacing(6)
+        opts.addWidget(QLabel("环境："))
+        self.env_combo = QComboBox()
+        self.env_combo.setFixedWidth(180)
+        self.env_combo.currentIndexChanged.connect(self._on_env_changed)
+        opts.addWidget(self.env_combo)
+        b_env = QPushButton("管理环境")
+        b_env.clicked.connect(self.manage_envs)
+        opts.addWidget(b_env)
+        opts.addSpacing(10)
+        self.verify_chk = QCheckBox("验证 SSL 证书")
+        self.verify_chk.setChecked(False)
+        opts.addWidget(self.verify_chk)
+        self.redirect_chk = QCheckBox("跟随重定向")
+        self.redirect_chk.setChecked(True)
+        opts.addWidget(self.redirect_chk)
+        opts.addWidget(QLabel("超时(秒)："))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(1, 600)
+        self.timeout_spin.setValue(30)
+        opts.addWidget(self.timeout_spin)
+        self.var_hint = QLabel("")
+        self.var_hint.setStyleSheet(self._hint_style())
+        opts.addWidget(self.var_hint, 1)
+        root.addLayout(opts)
+
+        # 标签工具条
+        tb = QHBoxLayout()
+        tb.setSpacing(6)
+        b_new = QPushButton("＋ 新建请求")
+        b_new.clicked.connect(lambda: self._new_request_tab())
+        b_new.setFixedHeight(28)
+        tb.addWidget(b_new)
+        b_close = QPushButton("× 关闭当前标签")
+        b_close.clicked.connect(self._close_current_tab)
+        b_close.setFixedHeight(28)
+        tb.addWidget(b_close)
+        tb.addSpacing(12)
+        tb.addWidget(QLabel("主题："))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["深色", "浅色"])
+        self.theme_combo.setFixedWidth(96)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        tb.addWidget(self.theme_combo)
+        tb.addStretch(1)
+        root.addLayout(tb)
+
+        # 主分栏：左侧历史/集合，右侧请求标签
+        main_split = QSplitter(Qt.Horizontal)
+        root.addWidget(main_split, 1)
+
+        left = QTabWidget()
+        hist_wrap = QWidget()
+        hv = QVBoxLayout(hist_wrap)
+        hv.setContentsMargins(6, 6, 6, 6)
+        hv.setSpacing(6)
+        self.hist_filter = QLineEdit()
+        self.hist_filter.setPlaceholderText("搜索 URL 关键字…")
+        self.hist_filter.textChanged.connect(self._rebuild_history)
+        hv.addWidget(self.hist_filter)
+        frow = QHBoxLayout()
+        self.hist_method = QComboBox()
+        self.hist_method.addItem("全部方法", None)
+        for m in METHODS:
+            self.hist_method.addItem(m, m)
+        self.hist_method.currentIndexChanged.connect(self._rebuild_history)
+        self.hist_status = QComboBox()
+        self.hist_status.addItem("全部状态", None)
+        for s in ("2xx", "3xx", "4xx", "5xx"):
+            self.hist_status.addItem(s, s)
+        self.hist_status.addItem("失败(ERR)", "ERR")
+        self.hist_status.currentIndexChanged.connect(self._rebuild_history)
+        frow.addWidget(self.hist_method, 1)
+        frow.addWidget(self.hist_status, 1)
+        hv.addLayout(frow)
+        self.history_list = QListWidget()
+        self.history_list.itemDoubleClicked.connect(self._load_history_item)
+        self.history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.history_list.customContextMenuRequested.connect(self._history_menu)
+        hv.addWidget(self.history_list, 1)
+        left.addTab(hist_wrap, "历史记录")
+
+        coll_wrap = QWidget()
+        cv = QVBoxLayout(coll_wrap)
+        cv.setContentsMargins(6, 6, 6, 6)
+        self.coll_tree = QTreeWidget()
+        self.coll_tree.setHeaderHidden(True)
+        self.coll_tree.itemDoubleClicked.connect(self._load_collection_item)
+        self.coll_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.coll_tree.customContextMenuRequested.connect(self._collection_menu)
+        cv.addWidget(self.coll_tree, 1)
+        left.addTab(coll_wrap, "集合")
+
+        self.request_tabs = QTabWidget()
+        self.request_tabs.setTabsClosable(True)
+        self.request_tabs.tabCloseRequested.connect(self._close_request_tab)
+        main_split.addWidget(left)
+        main_split.addWidget(self.request_tabs)
+        main_split.setSizes([300, 1020])
+
+        for seq, slot in (
+            ("Ctrl+Return", self._send_current),
+            ("Ctrl+Enter", self._send_current),
+            ("Ctrl+S", lambda: self.save_to_collection(self.current_tab())),
+        ):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
+
+        self.setCentralWidget(central)
+        self.statusBar().showMessage("就绪")
+
+    # ------------------------------------------------------------------
+    # 主题
+    # ------------------------------------------------------------------
+    def current_theme(self) -> str:
+        return self._theme
+
+    def _hint_style(self) -> str:
+        return f"color:{THEME_COLORS[self._theme]['hint']};"
+
+    def _on_theme_changed(self, index: int) -> None:
+        name = "dark" if index == 0 else "light"
+        self._apply_theme(name)
+        s = self._settings()
+        s["theme"] = name
+        self._persist()
+        self.status_msg("主题已切换为：" + ("深色" if name == "dark" else "浅色"))
+
+    def _apply_theme(self, name: str) -> None:
+        self._theme = name if name in THEMES else "dark"
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(THEMES[self._theme])
+        for tab in self._tabs:
+            tab.set_theme(self._theme)
+        self._update_var_hint()
+
+    # ------------------------------------------------------------------
+    # 请求标签页管理
+    # ------------------------------------------------------------------
+    def current_tab(self) -> "RequestTab | None":
+        return self.request_tabs.currentWidget()
+
+    def _send_current(self) -> None:
+        tab = self.current_tab()
+        if tab is not None:
+            tab.send_request()
+
+    def _new_request_tab(self, initial: dict = None) -> "RequestTab":
+        tab = RequestTab(self, initial)
+        self._tabs.append(tab)
+        idx = self.request_tabs.addTab(tab, "新请求")
+        self.request_tabs.setCurrentIndex(idx)
+        self._update_tab_label(tab)
+        return tab
+
+    def _update_tab_label(self, tab: "RequestTab") -> None:
+        idx = self.request_tabs.indexOf(tab)
+        if idx < 0:
+            return
+        m = tab.method_combo.currentText()
+        u = tab.url_edit.text().strip()
+        label = m + " " + (u.split("?")[0][:42] if u else "新请求")
+        self.request_tabs.setTabText(idx, label)
+
+    def _close_request_tab(self, index: int) -> None:
+        tab = self.request_tabs.widget(index)
+        if tab is None:
+            return
+        if tab.worker is not None and tab.worker.isRunning():
+            QMessageBox.information(self, "提示", "该标签请求正在进行中，请等待完成后再关闭。")
+            return
+        if tab.is_dirty:
+            if (
+                QMessageBox.question(
+                    self, "关闭确认", "该请求尚未保存到集合，关闭将丢失当前编辑内容。是否继续关闭？"
+                )
+                != QMessageBox.Yes
+            ):
+                return
+        self._tabs.remove(tab)
+        self.request_tabs.removeTab(index)
+        tab.deleteLater()
+        if self.request_tabs.count() == 0:
+            self._new_request_tab()
+
+    def _close_current_tab(self) -> None:
+        self._close_request_tab(self.request_tabs.currentIndex())
+
+    # ------------------------------------------------------------------
+    # 设置持久化
+    # ------------------------------------------------------------------
+    def _settings(self) -> dict:
+        return self.state.setdefault("settings", {})
+
+    def _load_settings(self) -> None:
+        s = self._settings()
+        self.timeout_spin.setValue(int(s.get("timeout", 30)))
+        self.verify_chk.setChecked(not bool(s.get("verify", True)))
+        self.redirect_chk.setChecked(bool(s.get("follow_redirects", True)))
+        theme = s.get("theme", "dark")
+        self._theme = theme if theme in THEMES else "dark"
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(0 if self._theme == "dark" else 1)
+        self.theme_combo.blockSignals(False)
+        self._apply_theme(self._theme)
+
+    def _save_settings(self) -> None:
+        s = self._settings()
+        s["timeout"] = self.timeout_spin.value()
+        s["verify"] = not self.verify_chk.isChecked()
+        s["follow_redirects"] = self.redirect_chk.isChecked()
+        s["theme"] = self._theme
+
+    def _persist(self) -> None:
+        save_state(self.state)
+
+    def status_msg(self, text: str, timeout: int = 5000) -> None:
+        self.statusBar().showMessage(text, timeout)
+
+    # ------------------------------------------------------------------
+    # 环境
+    # ------------------------------------------------------------------
+    def _refresh_env_combo(self) -> None:
+        self.env_combo.blockSignals(True)
+        self.env_combo.clear()
+        active = self.state.get("active_env", "")
+        for e in self.state.get("environments", []):
+            self.env_combo.addItem(e.get("name", ""))
+        if active:
+            idx = self.env_combo.findText(active)
+            if idx >= 0:
+                self.env_combo.setCurrentIndex(idx)
+        self.env_combo.blockSignals(False)
+        self._on_env_changed()
+
+    def _on_env_changed(self, *_args) -> None:
+        self.state["active_env"] = self.env_combo.currentText()
+        self._update_var_hint()
+        for tab in self._tabs:
+            tab.refresh_auth_preview()
+        self._persist()
+
+    def _update_var_hint(self) -> None:
+        env = self._current_env()
+        if env:
+            vars_ = [v for v in env.get("variables", []) if v.get("enabled", True)]
+            self.var_hint.setText(f"当前环境：{env.get('name')}（{len(vars_)} 个变量）")
+            self.var_hint.setStyleSheet(self._hint_style())
+        else:
+            self.var_hint.setText("")
+
+    def _current_env(self):
+        for e in self.state.get("environments", []):
+            if e.get("name") == self.env_combo.currentText():
+                return e
+        return None
+
+    def variables(self) -> dict:
+        env = self._current_env()
+        out = {}
+        if env:
+            for v in env.get("variables", []):
+                if v.get("enabled", True):
+                    out[v.get("key", "")] = v.get("value", "")
+        return out
+
+    def manage_envs(self) -> None:
+        dlg = EnvDialog(self.state.get("environments", []), self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self.state["environments"] = dlg.result_data()
+        self._refresh_env_combo()
+        self._persist()
+
+    # ------------------------------------------------------------------
+    # 历史记录
+    # ------------------------------------------------------------------
+    def _add_history(self, req: dict, status=None, error=None) -> None:
+        entry = {
+            "method": req.get("method", "GET"),
+            "url": req.get("url", ""),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "error": error,
+            "request": req,
+        }
+        hist = self.state.setdefault("history", [])
+        hist.insert(0, entry)
+        del hist[300:]
+        save_state(self.state)
+        self._rebuild_history()
+
     def _rebuild_history(self) -> None:
         self.history_list.clear()
+        kw = self.hist_filter.text().strip().lower()
+        meth = self.hist_method.currentData()
+        st = self.hist_status.currentData()
         for idx, h in enumerate(self.state.get("history", [])):
-            status = h.get("status")
-            tag = f"{status}" if status else ("ERR" if h.get("error") else "-")
+            url = (h.get("url") or "").lower()
+            if kw and kw not in url:
+                continue
+            if meth and h.get("method") != meth:
+                continue
+            s = h.get("status")
+            err = h.get("error")
+            if st == "ERR":
+                if not (err and s is None):
+                    continue
+            elif st:
+                if s is None or str(s)[0] != st[0]:
+                    continue
+            tag = f"{s}" if s else ("ERR" if err else "-")
             auth_tag = auth_tag_of(h.get("request"))
             suffix = f"　〔{auth_tag}〕" if auth_tag else ""
             item = QListWidgetItem(f"[{h.get('method')}] {tag}  {h.get('url', '')}{suffix}")
@@ -1856,13 +2192,26 @@ class MainWindow(QMainWindow):
         hist = self.state.get("history", [])
         if not (0 <= idx < len(hist)):
             return
-        self._apply_request(hist[idx].get("request", {}))
+        tab = self.current_tab()
+        if tab is None:
+            tab = self._new_request_tab()
+        tab.apply_request(hist[idx].get("request", {}))
         self.status_msg("已载入历史请求")
+
+    def _open_history_new_tab(self, item: QListWidgetItem) -> None:
+        idx = item.data(Qt.UserRole)
+        hist = self.state.get("history", [])
+        if not (0 <= idx < len(hist)):
+            return
+        tab = self._new_request_tab(hist[idx].get("request", {}))
+        self.request_tabs.setCurrentWidget(tab)
+        self.status_msg("已在新标签中打开历史请求")
 
     def _history_menu(self, pos) -> None:
         item = self.history_list.itemAt(pos)
         menu = QMenu(self)
-        act_open = menu.addAction("载入到编辑器") if item else None
+        act_open = menu.addAction("载入到当前标签") if item else None
+        act_new = menu.addAction("在新标签中打开") if item else None
         act_resend = menu.addAction("载入并重新发送") if item else None
         if item:
             menu.addSeparator()
@@ -1873,9 +2222,11 @@ class MainWindow(QMainWindow):
             return
         if act_open and chosen == act_open:
             self._load_history_item(item)
+        elif act_new and chosen == act_new:
+            self._open_history_new_tab(item)
         elif act_resend and chosen == act_resend:
             self._load_history_item(item)
-            self.send_request()
+            self._send_current()
         elif act_del and chosen == act_del:
             idx = item.data(Qt.UserRole)
             hist = self.state.get("history", [])
@@ -1964,12 +2315,15 @@ class MainWindow(QMainWindow):
         save_state(self.state)
         self._rebuild_collections()
 
-    def save_to_collection(self) -> None:
-        url = self.url_edit.text().strip()
+    def save_to_collection(self, tab=None) -> None:
+        tab = tab or self.current_tab()
+        if tab is None:
+            return
+        url = tab.url_edit.text().strip()
         if not url:
             QMessageBox.information(self, "提示", "请先输入请求地址。")
             return
-        default_name = f"{self.method_combo.currentText()} {url.split('?')[0].rstrip('/').split('/')[-1] or 'request'}"
+        default_name = f"{tab.method_combo.currentText()} {url.split('?')[0].rstrip('/').split('/')[-1] or 'request'}"
         name, ok = self._ask_text("保存到集合", "请求名称：", default_name)
         if not ok or not name.strip():
             return
@@ -1978,7 +2332,7 @@ class MainWindow(QMainWindow):
             "id": self._new_id(),
             "type": "request",
             "name": name.strip(),
-            "request": self._request_snapshot(),
+            "request": tab.snapshot(),
         }
         if sel:
             target, nodes, parent = sel
@@ -1999,6 +2353,7 @@ class MainWindow(QMainWindow):
             folder["children"].append(node)
         save_state(self.state)
         self._rebuild_collections()
+        tab.is_dirty = False
         self.status_msg(f"已保存到集合：{name.strip()}")
 
     def _load_collection_item(self, item: QTreeWidgetItem, _col: int = 0) -> None:
@@ -2008,7 +2363,10 @@ class MainWindow(QMainWindow):
         if node.get("type") == "folder":
             item.setExpanded(not item.isExpanded())
             return
-        self._apply_request(node.get("request", {}))
+        tab = self.current_tab()
+        if tab is None:
+            tab = self._new_request_tab()
+        tab.apply_request(node.get("request", {}))
         self.status_msg("已载入集合请求：" + node.get("name", ""))
 
     def _collection_menu(self, pos) -> None:
@@ -2018,7 +2376,8 @@ class MainWindow(QMainWindow):
         parent_list = found[1] if found else None
 
         menu = QMenu(self)
-        act_load = menu.addAction("载入到编辑器") if (sel_node and sel_node.get("type") == "request") else None
+        act_load = menu.addAction("载入到当前标签") if (sel_node and sel_node.get("type") == "request") else None
+        act_new = menu.addAction("在新标签中打开") if (sel_node and sel_node.get("type") == "request") else None
         act_save = menu.addAction("保存当前请求到此处")
         act_folder = menu.addAction("新建子文件夹")
         act_ren = menu.addAction("重命名") if sel_node else None
@@ -2028,7 +2387,14 @@ class MainWindow(QMainWindow):
             return
 
         if act_load is not None and chosen == act_load:
-            self._apply_request(sel_node.get("request", {}))
+            tab = self.current_tab()
+            if tab is None:
+                tab = self._new_request_tab()
+            tab.apply_request(sel_node.get("request", {}))
+        elif act_new is not None and chosen == act_new:
+            tab = self._new_request_tab(sel_node.get("request", {}))
+            self.request_tabs.setCurrentWidget(tab)
+            self.status_msg("已在新标签中打开：" + sel_node.get("name", ""))
         elif chosen == act_save:
             self.save_to_collection()
         elif chosen == act_folder:
@@ -2055,91 +2421,18 @@ class MainWindow(QMainWindow):
         return f"n{int(time.time() * 1000)}{os.urandom(2).hex()}"
 
     # ------------------------------------------------------------------
-    # 载入请求到编辑器
-    # ------------------------------------------------------------------
-    def _apply_request(self, req: dict) -> None:
-        if not req:
-            return
-        method = req.get("method", "GET")
-        if method in METHODS:
-            self.method_combo.setCurrentText(method)
-        self.url_edit.setText(req.get("url", ""))
-        self.params_table.set_pairs(req.get("params", []))
-        self.headers_table.set_pairs(req.get("headers", []))
-        btype = req.get("body_type", "none")
-        idx = {"none": 0, "JSON": 1, "form-data": 2, "x-www-form-urlencoded": 3}.get(btype, 0)
-        self.body_type.setCurrentIndex(idx)
-        self.body_stack.setCurrentIndex(idx)
-        self.body_json.setPlainText(req.get("body_json", ""))
-        self.body_form.set_pairs(req.get("body_form", []))
-        self.body_urlenc.set_pairs(req.get("body_urlenc", []))
-        self.set_auth(req.get("auth"))
-
-    # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
         self._save_settings()
         save_state(self.state)
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.wait(2000)
+        for tab in self._tabs:
+            if tab.worker is not None and tab.worker.isRunning():
+                tab.worker.wait(2000)
         super().closeEvent(event)
 
 
 # --------------------------------------------------------------------------
-QSS = """
-QWidget { font-family: "Microsoft YaHei UI","Segoe UI",sans-serif; font-size: 12px; }
-QMainWindow, QDialog { background: #1b1c1f; }
-QWidget { color: #d7dae0; }
-QLineEdit, QPlainTextEdit, QTableWidget, QListWidget, QTreeWidget, QComboBox, QSpinBox {
-    background: #24262a; border: 1px solid #34373d; border-radius: 6px;
-    selection-background-color: #3a6ea5; selection-color: #ffffff;
-}
-QLineEdit { padding: 6px 8px; }
-QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #ff8b3d; }
-QComboBox::drop-down { border: none; width: 18px; }
-QComboBox QAbstractItemView { background: #24262a; border: 1px solid #34373d; }
-QPlainTextEdit { padding: 6px; }
-QPushButton {
-    background: #2d3035; border: 1px solid #3a3e44; border-radius: 6px;
-    padding: 6px 12px; color: #dfe2e6;
-}
-QPushButton:hover { background: #363a41; border-color: #4a4f57; }
-QPushButton:pressed { background: #24262a; }
-QPushButton#primary { background: #ff6f3c; border: none; color: #ffffff; font-weight: 700; }
-QPushButton#primary:hover { background: #ff8253; }
-QPushButton#primary:disabled { background: #5a4034; color: #b9a79f; }
-QTabWidget::pane { border: 1px solid #2c2f34; border-radius: 8px; top: -1px; }
-QTabBar::tab {
-    background: transparent; color: #9aa0a6; padding: 7px 14px;
-    border: 1px solid transparent; border-top-left-radius: 6px; border-top-right-radius: 6px;
-}
-QTabBar::tab:selected { background: #24262a; color: #ffffff; border-color: #2c2f34; }
-QTabBar::tab:hover { color: #e6e8ea; }
-QHeaderView::section {
-    background: #24262a; color: #9aa0a6; padding: 5px 6px; border: none;
-    border-right: 1px solid #2c2f34; border-bottom: 1px solid #2c2f34;
-}
-QTableWidget { gridline-color: #2c2f34; }
-QListWidget::item, QTreeWidget::item { padding: 4px 6px; border-radius: 4px; }
-QListWidget::item:selected, QTreeWidget::item:selected { background: #3a6ea5; color: #ffffff; }
-QSplitter::handle { background: #2c2f34; }
-QSplitter::handle:horizontal { width: 4px; }
-QSplitter::handle:vertical { height: 4px; }
-QCheckBox { spacing: 6px; }
-QStatusBar { color: #8d949c; }
-QScrollBar:vertical { background: #1b1c1f; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #3a3e44; border-radius: 5px; min-height: 30px; }
-QScrollBar::handle:vertical:hover { background: #4a4f57; }
-QScrollBar:horizontal { background: #1b1c1f; height: 10px; margin: 0; }
-QScrollBar::handle:horizontal { background: #3a3e44; border-radius: 5px; min-width: 30px; }
-QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QMenu { background: #24262a; border: 1px solid #34373d; padding: 4px; }
-QMenu::item { padding: 6px 20px; border-radius: 4px; }
-QMenu::item:selected { background: #3a6ea5; }
-"""
-
-
 def run_self_test() -> None:
-    """`HttpLite.exe --self-test`：在打包环境中验证 HTTP/SSL/JSON 能力并写出结果文件。"""
+    """`HttpLite.exe --self-test`：在打包环境中验证 HTTP/SSL/JSON/认证与 UI 能力并写出结果文件。"""
     lines = []
     ok = False
     try:
@@ -2226,6 +2519,48 @@ def run_self_test() -> None:
         auth_ok = False
         lines.append("auth inject error: " + repr(e))
     ok = ok and auth_ok
+
+    # UI 冒烟：多标签 / 主题 / 历史过滤（离屏）
+    try:
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        qapp = QApplication(sys.argv)
+        qapp.setStyleSheet(THEMES["dark"])
+        win = MainWindow()
+        base = win.request_tabs.count()
+        win._new_request_tab()
+        win._new_request_tab()
+        added = win.request_tabs.count()
+        win._close_request_tab(win.request_tabs.count() - 1)
+        closed = win.request_tabs.count()
+        win._apply_theme("light")
+        theme_ok = win._theme == "light" and bool(QApplication.instance().styleSheet())
+        win._add_history(
+            {"method": "GET", "url": "https://www.baidu.com", "params": [], "headers": [],
+             "body_type": "none", "body_json": "", "body_form": [], "body_urlenc": [], "auth": default_auth()},
+            status=200,
+        )
+        win.hist_filter.setText("baidu")
+        flt_kw = win.history_list.count()
+        win.hist_filter.setText("")
+        win.hist_status.setCurrentIndex(1)  # 2xx
+        flt_st = win.history_list.count()
+        win._apply_theme("dark")
+        win.close()
+        good_ui = (
+            added == base + 2
+            and closed == added - 1
+            and theme_ok
+            and flt_kw >= 1
+            and flt_st >= 1
+        )
+        ok = ok and good_ui
+        lines.append(f"ui multi-tab: base={base} add={added} close={closed}")
+        lines.append(f"theme light qss: {'ok' if theme_ok else 'FAIL'}")
+        lines.append(f"history filter: kw_baidu={flt_kw} status_2xx={flt_st}")
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("ui smoke error: " + repr(e))
+
     lines.append("frozen: " + str(getattr(sys, "frozen", False)))
     lines.append("data_dir: " + DATA_DIR)
     lines.append("requests: " + getattr(requests, "__version__", "?"))
@@ -2238,8 +2573,8 @@ def run_self_test() -> None:
     sys.exit(0 if ok else 2)
 
 
-def run_ui_shot(out_dir: str) -> None:
-    """`HttpLite.exe --ui-shot <目录>`：离屏渲染 Authorization 面板并截图，用于打包后界面核验。"""
+def run_ui_shot(out_dir: str, theme_name: str = None) -> None:
+    """`HttpLite.exe --ui-shot <目录> [dark|light]`：离屏渲染界面并截图（浅色 / 深色两套）。"""
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     lines = []
     try:
@@ -2248,73 +2583,103 @@ def run_ui_shot(out_dir: str) -> None:
         lines.append("mkdir error: " + repr(e))
     try:
         qapp = QApplication(sys.argv)
-        qapp.setStyleSheet(QSS)
-        win = MainWindow()
-        win.resize(1240, 800)
-        win.show()
-        qapp.processEvents()
-        req_tabs = None
-        for t in win.findChildren(QTabWidget):
-            if "Authorization" in [t.tabText(i) for i in range(t.count())]:
-                req_tabs = t
-        lines.append("auth pages: " + str(win.auth_stack.count()))
-        lines.append("auth types: " + " / ".join(win.auth_type.itemText(i) for i in range(win.auth_type.count())))
-        lines.append("auth tab found: " + str(req_tabs is not None))
-        if req_tabs is not None:
-            labels = [req_tabs.tabText(i) for i in range(req_tabs.count())]
-            req_tabs.setCurrentIndex(labels.index("Authorization"))
-        win.url_edit.setText("https://api.example.com/v1/orders")
-        win.method_combo.setCurrentText("POST")
-        qapp.processEvents()
-        shots = [
-            ("auth_bearer.png", bearer_auth("eyJhbGciOiJIUzI1NiJ9.demo.token")),
-            ("auth_basic.png", merge_auth({"type": "basic", "basic": {"username": "demo", "password": "s3cret"}})),
-            (
-                "auth_apikey.png",
-                merge_auth(
-                    {"type": "apikey", "apikey": {"key": "X-API-Key", "value": "sk-live-123", "in": "query"}}
-                ),
-            ),
-            (
-                "auth_aws.png",
-                merge_auth(
-                    {
-                        "type": "awsv4",
-                        "awsv4": {
-                            "access_key": "AKIAIOSFODNN7EXAMPLE",
-                            "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-                            "session_token": "",
-                            "region": "us-east-1",
-                            "service": "execute-api",
-                        },
-                    }
-                ),
-            ),
-            (
-                "auth_jwt.png",
-                merge_auth(
-                    {
-                        "type": "jwt",
-                        "jwt": {
-                            "algorithm": "HS256",
-                            "secret": "topsecret",
-                            "payload": '{\n    "sub": "1234567890",\n    "name": "HttpLite"\n}',
-                            "location": "header",
-                            "header_name": "Authorization",
-                            "prefix": "Bearer ",
-                        },
-                    }
-                ),
-            ),
-        ]
-        for name, cfg in shots:
-            win.set_auth(cfg)
+        themes = [theme_name] if theme_name else ["dark", "light"]
+        for theme in themes:
+            qapp.setStyleSheet(THEMES[theme])
+            win = MainWindow()
+            win._apply_theme(theme)
+            win.resize(1240, 800)
+            win.show()
             qapp.processEvents()
-            ok = win.grab().save(os.path.join(out_dir, name))
-            lines.append(
-                f"{name} saved={ok} type={win.auth_type.currentText()} panel={win.auth_stack.currentIndex()}"
+            tab = win._tabs[0]
+            # 演示多标签：新增一个带内容的标签
+            win._new_request_tab(
+                {
+                    "method": "GET",
+                    "url": "https://httpbin.org/get?from=multi",
+                    "params": [{"key": "from", "value": "multi", "enabled": True}],
+                    "headers": [],
+                    "body_type": "none",
+                    "body_json": "",
+                    "body_form": [],
+                    "body_urlenc": [],
+                    "auth": default_auth(),
+                }
             )
-        lines.append("preview: " + win.auth_preview.text()[:160])
+            tabs_found = any(
+                "Authorization" in [t.req_tabs.tabText(i) for i in range(t.req_tabs.count())]
+                for t in win._tabs
+            )
+            lines.append(f"[{theme}] auth pages: {win._tabs[0].auth_stack.count()}")
+            lines.append(
+                f"[{theme}] auth types: {' / '.join(win._tabs[0].auth_type.itemText(i) for i in range(win._tabs[0].auth_type.count()))}"
+            )
+            lines.append(f"[{theme}] auth tab found: {tabs_found}")
+            win.request_tabs.setCurrentIndex(0)
+            tab.url_edit.setText("https://api.example.com/v1/orders")
+            tab.method_combo.setCurrentText("POST")
+            qapp.processEvents()
+            shots = [
+                ("auth_bearer.png", bearer_auth("eyJhbGciOiJIUzI1NiJ9.demo.token")),
+                ("auth_basic.png", merge_auth({"type": "basic", "basic": {"username": "demo", "password": "s3cret"}})),
+                (
+                    "auth_apikey.png",
+                    merge_auth(
+                        {"type": "apikey", "apikey": {"key": "X-API-Key", "value": "sk-live-123", "in": "query"}}
+                    ),
+                ),
+                (
+                    "auth_aws.png",
+                    merge_auth(
+                        {
+                            "type": "awsv4",
+                            "awsv4": {
+                                "access_key": "AKIAIOSFODNN7EXAMPLE",
+                                "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                                "session_token": "",
+                                "region": "us-east-1",
+                                "service": "execute-api",
+                            },
+                        }
+                    ),
+                ),
+                (
+                    "auth_jwt.png",
+                    merge_auth(
+                        {
+                            "type": "jwt",
+                            "jwt": {
+                                "algorithm": "HS256",
+                                "secret": "topsecret",
+                                "payload": '{\n    "sub": "1234567890",\n    "name": "HttpLite"\n}',
+                                "location": "header",
+                                "header_name": "Authorization",
+                                "prefix": "Bearer ",
+                            },
+                        }
+                    ),
+                ),
+            ]
+            for name, cfg in shots:
+                tab.set_auth(cfg)
+                qapp.processEvents()
+                saved = win.grab().save(os.path.join(out_dir, f"{theme}_{name}"))
+                lines.append(
+                    f"[{theme}] {name} saved={saved} type={tab.auth_type.currentText()} panel={tab.auth_stack.currentIndex()}"
+                )
+            lines.append(f"[{theme}] preview: {tab.auth_preview.text()[:160]}")
+            # 多标签视图
+            win.request_tabs.setCurrentIndex(1)
+            qapp.processEvents()
+            saved = win.grab().save(os.path.join(out_dir, f"{theme}_multi_tab.png"))
+            lines.append(f"[{theme}] multi_tab saved={saved} tabs={win.request_tabs.count()}")
+            # 历史搜索过滤视图
+            win.hist_filter.setText("httpbin")
+            win.request_tabs.setCurrentIndex(0)
+            qapp.processEvents()
+            saved = win.grab().save(os.path.join(out_dir, f"{theme}_history_filter.png"))
+            lines.append(f"[{theme}] history_filter saved={saved} items={win.history_list.count()}")
+            win.close()
     except Exception as e:  # noqa: BLE001
         lines.append("ui-shot error: " + repr(e))
     try:
@@ -2332,12 +2697,15 @@ def main() -> None:
     if "--ui-shot" in sys.argv:
         pos = sys.argv.index("--ui-shot")
         target = sys.argv[pos + 1] if len(sys.argv) > pos + 1 else app_dir()
-        run_ui_shot(target)
+        theme = None
+        if len(sys.argv) > pos + 2 and sys.argv[pos + 2] in ("dark", "light"):
+            theme = sys.argv[pos + 2]
+        run_ui_shot(target, theme)
         return
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
-    app.setStyleSheet(QSS)
+    app.setStyleSheet(THEMES["dark"])
     app.setWindowIcon(make_app_icon())
     win = MainWindow()
     win.show()

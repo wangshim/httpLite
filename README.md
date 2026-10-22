@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 5c96509d255f4e87c60df81df97919d9_8e7ff489b26e11f1b2fa525400638852
+    ReservedCode1: GW+l3pQmMf6TAFPnjeGpG7ZzyfxuxWTg1rCfyr9D+8XGTv2Kl2xfpJVMgVBQhBl0c+SjSRShxAcbuhtq2PYghJmMGr6WZpQ+VC7gJuGn9bZj3zHtn+o+w+jgQuQpcy41hFhkYZpbkac0mpT17Zn4XiGusg8AD/ZJslCvD1Ya7K4Y+h5gFk8e7AcowpU=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 5c96509d255f4e87c60df81df97919d9_8e7ff489b26e11f1b2fa525400638852
+    ReservedCode2: GW+l3pQmMf6TAFPnjeGpG7ZzyfxuxWTg1rCfyr9D+8XGTv2Kl2xfpJVMgVBQhBl0c+SjSRShxAcbuhtq2PYghJmMGr6WZpQ+VC7gJuGn9bZj3zHtn+o+w+jgQuQpcy41hFhkYZpbkac0mpT17Zn4XiGusg8AD/ZJslCvD1Ya7K4Y+h5gFk8e7AcowpU=
+---
+
 # HttpLite
 
 > 轻量级 HTTP 接口测试工具（类 Postman），基于 Python + PySide6 开发，可打包为**免安装单文件 exe**，绿色便携。
@@ -18,6 +29,13 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
   - `form-data`：表单上传
   - `x-www-form-urlencoded`：URL 编码表单
 
+### 多标签页
+- 同时打开多个请求标签，每个标签都是一套**完整且独立**的请求上下文（方法、URL、Query、Headers、Body、认证配置、响应区）
+- 顶部「＋」新建标签；标签页右侧关闭按钮或 `Ctrl+W` 关闭当前标签
+- 标签标题实时反映当前请求（如 `POST {{base_url}}/api/login`），未保存的改动以 `●` 标记
+- 关闭未保存到集合的标签时给出提示（不强制保存），已保存或未改动的标签直接关闭
+- 新建的请求标签始终跟随全局设置，主题切换后所有标签即时联动
+
 ### 响应查看
 - 状态码按语义着色（2xx 绿 / 3xx 蓝 / 4xx 橙 / 5xx 红）
 - 显示请求耗时与响应体大小
@@ -27,8 +45,14 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 
 ### 历史记录与集合
 - 每次发送自动写入**历史记录**，右键可重发、另存到集合、清空历史
+- 历史列表顶部提供**搜索与过滤**：按 URL 关键字实时过滤，并按请求方法、响应状态码（2xx / 3xx / 4xx / 5xx / 错误）下拉筛选，三个条件可叠加
 - **集合**以树形结构管理（文件夹 / 请求），支持新建、重命名、删除、右键发送
 - 请求可一键「保存到集合」（快捷键 `Ctrl+S`），完整保留方法、地址、参数、请求头、Body 与认证配置
+
+### 主题（深色 / 浅色）
+- 设置区提供「深色」/「浅色」主题下拉切换，选择即时生效并**持久化**到 `workspace.json`，下次启动自动恢复
+- 全部界面元素适配深色：主窗口、请求编辑区、表格、标签页、菜单、认证面板、JSON 高亮、状态徽章等
+- 深色主题面向夜间 / 暗色环境下的长时间调试场景
 
 ### 环境变量
 - 多环境管理，环境之间可切换、复制、重命名、删除
@@ -62,8 +86,10 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 
 | 快捷键 | 功能 |
 | --- | --- |
-| `Ctrl+Enter` / `Ctrl+Return` | 发送请求 |
-| `Ctrl+S` | 保存当前请求到集合 |
+| `Ctrl+Enter` / `Ctrl+Return` | 发送当前标签的请求 |
+| `Ctrl+S` | 保存当前标签的请求到集合 |
+| `Ctrl+T` | 新建请求标签 |
+| `Ctrl+W` | 关闭当前请求标签 |
 
 ---
 
@@ -123,8 +149,8 @@ pyinstaller HttpLite.spec
 exe 内置两个免交互自检开关，便于确认打包产物在 frozen 环境下能力正常：
 
 ```bash
-HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON 能力，结果写入 exe 同级的 HttpLite_selftest.txt
-HttpLite.exe --ui-shot <输出目录>    # 离屏渲染 Authorization 面板并截图，用于界面核验
+HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON / 认证向量 / UI 冒烟，结果写入 exe 同级的 HttpLite_selftest.txt
+HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（认证面板 / 多标签 / 历史过滤），默认深色
 ```
 
 ---
@@ -132,7 +158,7 @@ HttpLite.exe --ui-shot <输出目录>    # 离屏渲染 Authorization 面板并�
 ## 技术栈
 
 - **语言**：Python 3.11
-- **GUI**：PySide6（Qt for Python），单窗口 + 多标签页布局，`QSyntaxHighlighter` 实现 JSON 高亮
+- **GUI**：PySide6（Qt for Python），单窗口 + 多标签页布局，`QSyntaxHighlighter` 实现 JSON 高亮，内置深 / 浅两套 QSS 主题并支持运行时切换
 - **网络**：requests（含 `HTTPDigestAuth`），请求在独立 `QThread` 中执行，避免阻塞界面
 - **认证签名**：标准库 `hmac` / `hashlib` / `base64` 手写实现 AWS Signature v4 与 JWT 签发
 - **数据持久化**：单个 `workspace.json` 文件
@@ -164,3 +190,4 @@ HttpLite_selftest.txt          # --self-test 输出
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
+*（内容由AI生成，仅供参考）*

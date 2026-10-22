@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['F:/DevEnv/httplite-src/app.py'],
+    ['app.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['F:/DevEnv/httplite-src/HttpLite.ico'],
+    icon=['HttpLite.ico'],
 )
