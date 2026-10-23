@@ -27,9 +27,10 @@ try:
 except Exception:  # pragma: no cover
     pass
 
-from PySide6.QtCore import Qt, QThread, Signal, QRegularExpression, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QRegularExpression, QSize, QUrl
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QIcon,
     QPainter,
@@ -264,9 +265,15 @@ AUTH_TYPE_LABELS = [
     "API Key",
     "AWS Signature v4",
     "JWT",
+    "OAuth 2.0",
 ]
-AUTH_TYPE_KEYS = ["noauth", "bearer", "basic", "digest", "apikey", "awsv4", "jwt"]
+AUTH_TYPE_KEYS = ["noauth", "bearer", "basic", "digest", "apikey", "awsv4", "jwt", "oauth2"]
 JWT_ALGORITHMS = ["HS256", "HS384", "HS512", "none"]
+OAUTH2_GRANTS = [
+    ("client_credentials", "Client Credentials（客户端凭证）"),
+    ("password", "Password（密码模式）"),
+    ("authorization_code", "Authorization Code（授权码模式）"),
+]
 
 
 def default_auth() -> dict:
@@ -290,6 +297,24 @@ def default_auth() -> dict:
             "location": "header",
             "header_name": "Authorization",
             "prefix": "Bearer ",
+        },
+        "oauth2": {
+            "grant_type": "client_credentials",
+            "token_url": "",
+            "client_id": "",
+            "client_secret": "",
+            "username": "",
+            "password": "",
+            "scope": "",
+            "extra": "",
+            "authorize_url": "",
+            "redirect_uri": "",
+            "authorization_code": "",
+            "access_token": "",
+            "refresh_token": "",
+            "token_type": "Bearer",
+            "auto_refresh": False,
+            "expires_at": 0,
         },
     }
 
@@ -506,6 +531,176 @@ def aws_sign_v4(payload: dict, cfg: dict, variables: dict, amz_date: str = None)
     return out, None
 
 
+# --------------------------------------------------------------------------
+# OAuth 2.0 认证内核
+# --------------------------------------------------------------------------
+def _oauth2_token_request(cfg: dict, variables: dict, extra_data: dict) -> tuple:
+    """向 token_url 发起表单 POST，返回 (json_obj, error)。"""
+    token_url = substitute(cfg.get("token_url", ""), variables).strip()
+    if not token_url:
+        return None, "请填写 Token URL"
+    data = dict(extra_data)
+    client_id = substitute(cfg.get("client_id", ""), variables).strip()
+    client_secret = substitute(cfg.get("client_secret", ""), variables).strip()
+    if client_id:
+        data["client_id"] = client_id
+    if client_secret:
+        data["client_secret"] = client_secret
+    scope = substitute(cfg.get("scope", ""), variables).strip()
+    if scope:
+        data["scope"] = scope
+    extra = substitute(cfg.get("extra", ""), variables).strip()
+    if extra:
+        try:
+            parsed = json.loads(extra)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    data[k] = v
+        except Exception as e:
+            return None, f"额外参数不是合法 JSON：{e}"
+    try:
+        resp = requests.post(
+            token_url,
+            data=data,
+            timeout=20,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+        )
+        if resp.status_code >= 400:
+            return None, f"Token 端点返回 HTTP {resp.status_code}：{resp.text[:300]}"
+        try:
+            obj = resp.json()
+        except Exception:
+            return None, "Token 端点未返回 JSON：" + resp.text[:300]
+        if not isinstance(obj, dict):
+            return None, "Token 端点返回结构异常：" + resp.text[:300]
+        return obj, None
+    except Exception as e:
+        return None, str(e)
+
+
+def oauth2_fetch_token(cfg: dict, variables: dict) -> tuple:
+    """按 grant_type 获取 access_token。返回 (token_dict, error)。"""
+    grant = cfg.get("grant_type") or "client_credentials"
+    if grant == "authorization_code":
+        code = substitute(cfg.get("authorization_code", ""), variables).strip()
+        if not code:
+            return None, "缺少授权码（authorization code），请点击「获取授权码」或手动粘贴回调地址"
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": substitute(cfg.get("redirect_uri", ""), variables).strip(),
+        }
+    elif grant == "password":
+        username = substitute(cfg.get("username", ""), variables).strip()
+        password = substitute(cfg.get("password", ""), variables).strip()
+        if not username or not password:
+            return None, "Password 模式需要填写用户名与密码"
+        data = {"grant_type": "password", "username": username, "password": password}
+    else:
+        data = {"grant_type": "client_credentials"}
+    obj, err = _oauth2_token_request(cfg, variables, data)
+    if err:
+        return None, err
+    token = obj.get("access_token")
+    if not token:
+        return None, "响应中没有 access_token：" + json.dumps(obj, ensure_ascii=False)[:300]
+    return {
+        "access_token": token,
+        "refresh_token": obj.get("refresh_token"),
+        "expires_in": obj.get("expires_in"),
+    }, None
+
+
+def oauth2_refresh_token(cfg: dict, variables: dict) -> tuple:
+    """用 refresh_token 刷新。返回 (token_dict, error)。"""
+    refresh = substitute(cfg.get("refresh_token", ""), variables).strip()
+    if not refresh:
+        return None, "缺少 refresh_token，无法刷新"
+    obj, err = _oauth2_token_request(
+        cfg, variables, {"grant_type": "refresh_token", "refresh_token": refresh}
+    )
+    if err:
+        return None, err
+    token = obj.get("access_token")
+    if not token:
+        return None, "响应中没有 access_token：" + json.dumps(obj, ensure_ascii=False)[:300]
+    return {
+        "access_token": token,
+        "refresh_token": obj.get("refresh_token") or refresh,
+        "expires_in": obj.get("expires_in"),
+    }, None
+
+
+def _oauth2_save_token(cfg: dict, token_dict: dict) -> None:
+    cfg["access_token"] = token_dict.get("access_token", "")
+    if token_dict.get("refresh_token"):
+        cfg["refresh_token"] = token_dict["refresh_token"]
+    expires_in = token_dict.get("expires_in")
+    try:
+        cfg["expires_at"] = int(time.time()) + int(expires_in) if expires_in is not None else 0
+    except Exception:
+        cfg["expires_at"] = 0
+    cfg["authorization_code"] = ""
+
+
+def oauth2_ensure_token(cfg: dict, variables: dict) -> tuple:
+    """确保有可用的 access_token（必要时自动获取 / 刷新），并把结果回写 cfg。返回 (token, error)。"""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    token = substitute(cfg.get("access_token", ""), variables).strip()
+    expires_at = cfg.get("expires_at") or 0
+    now = time.time()
+    if token and (not expires_at or now < int(expires_at) - 30):
+        return token, None
+    if cfg.get("auto_refresh") and substitute(cfg.get("refresh_token", ""), variables).strip():
+        token_dict, err = oauth2_refresh_token(cfg, variables)
+        if err is None:
+            _oauth2_save_token(cfg, token_dict)
+            return token_dict["access_token"], None
+    token_dict, err = oauth2_fetch_token(cfg, variables)
+    if err:
+        return None, err
+    _oauth2_save_token(cfg, token_dict)
+    return token_dict["access_token"], None
+
+
+def oauth2_build_authorize_url(cfg: dict, variables: dict) -> str:
+    """拼接授权码模式的授权 URL。"""
+    base = substitute(cfg.get("authorize_url", ""), variables).strip()
+    if not base:
+        return ""
+    parts = parse_qsl(urlsplit(base).query, keep_blank_values=True)
+    parts = [
+        p
+        for p in parts
+        if p[0] not in ("response_type", "client_id", "redirect_uri", "scope", "state")
+    ]
+    parts.append(("response_type", "code"))
+    client_id = substitute(cfg.get("client_id", ""), variables).strip()
+    if client_id:
+        parts.append(("client_id", client_id))
+    redirect_uri = substitute(cfg.get("redirect_uri", ""), variables).strip()
+    if redirect_uri:
+        parts.append(("redirect_uri", redirect_uri))
+    scope = substitute(cfg.get("scope", ""), variables).strip()
+    if scope:
+        parts.append(("scope", scope))
+    parts.append(("state", "hl" + str(int(time.time()))))
+    return base.split("?", 1)[0] + "?" + urlencode(parts, doseq=True)
+
+
+def oauth2_extract_code(callback: str) -> str:
+    """从回调地址 / 文本中提取 authorization code。"""
+    if not callback:
+        return ""
+    m = re.search(r"(?:[?&]|^)code=([^&]+)", callback)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def apply_auth(payload: dict, auth: dict, variables: dict) -> list:
     """把认证配置真正写入请求（headers / params / requests_auth），返回说明列表。"""
     notes = []
@@ -583,9 +778,207 @@ def apply_auth(payload: dict, auth: dict, variables: dict) -> list:
                 name = (cfg.get("header_name") or "").strip() or "Authorization"
                 set_header(headers, name, value)
                 notes.append(f"{name}: {mask_secret(value, 12)}")
+    elif atype == "oauth2":
+        cfg = auth["oauth2"]
+        if payload.get("_preview"):
+            cached = substitute(cfg.get("access_token", ""), variables).strip()
+            if cached:
+                set_header(headers, "Authorization", "Bearer " + cached)
+                notes.append("OAuth 2.0：将附加缓存 Bearer Token（发送请求时可能自动刷新）")
+            else:
+                grant = cfg.get("grant_type") or "client_credentials"
+                notes.append(
+                    "OAuth 2.0：发送请求时将自动获取 access_token（"
+                    + dict(OAUTH2_GRANTS).get(grant, grant)
+                    + "）"
+                )
+        else:
+            token, err = oauth2_ensure_token(cfg, variables)
+            if err:
+                notes.append("OAuth 2.0 获取令牌失败：" + err)
+            elif token:
+                set_header(headers, "Authorization", "Bearer " + token)
+                notes.append("OAuth 2.0 已附加 Bearer Token：" + mask_secret(token, 8))
 
     payload["params"] = params or None
     return notes
+
+
+# --------------------------------------------------------------------------
+# 代码生成（curl / Python / JavaScript）
+# --------------------------------------------------------------------------
+def _enabled_pairs(rows) -> list:
+    """把 KeyValueTable 行 / 快照中的 params 转成 (key, value) 列表，过滤未启用与空 key。"""
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get("enabled") is False:
+            continue
+        k = str(r.get("key", "") or "")
+        if k:
+            out.append((k, r.get("value", "")))
+    return out
+
+
+def _js_str(text: str) -> str:
+    return json.dumps(str(text), ensure_ascii=False)
+
+
+def generate_code_snippets(req: dict, variables: dict = None) -> dict:
+    """把请求快照（snapshot 结构）转成 curl / Python(requests) / JavaScript(fetch) 三段代码。
+
+    认证头由 apply_auth 以预览模式注入（OAuth 2.0 仅使用已缓存 token，不触发网络请求）。
+    """
+    variables = variables or {}
+    method = (req.get("method") or "GET").upper()
+    raw_url = substitute(str(req.get("url") or ""), variables).strip()
+    auth = req.get("auth") or default_auth()
+
+    params = _enabled_pairs(req.get("params"))
+    headers = {}
+    for k, v in _enabled_pairs(req.get("headers")):
+        set_header(headers, str(k), str(v))
+    probe = {
+        "method": method,
+        "url": raw_url,
+        "headers": headers,
+        "params": list(params),
+        "data": None,
+        "files": None,
+        "json": None,
+        "requests_auth": None,
+        "_preview": True,
+    }
+    try:
+        apply_auth(probe, auth, variables)
+    except Exception as e:  # noqa: BLE001
+        headers["X-HttpLite-Auth-Error"] = str(e)
+    params = probe["params"] or []
+
+    query_s = "&".join(f"{quote(k, safe='')}={quote(str(v), safe='')}" for k, v in params)
+    url = raw_url
+    if query_s:
+        url = url + ("&" if "?" in url else "?") + query_s
+
+    body_kind = req.get("body_type") or "none"
+    body_json = req.get("body_json") or ""
+    body_form = _enabled_pairs(req.get("body_form"))
+    body_urlenc = _enabled_pairs(req.get("body_urlenc"))
+
+    body_text = ""
+    py_body = ""
+    body_kw = "data"
+    js_body = ""
+
+    if body_kind == "JSON" and body_json.strip():
+        try:
+            obj = json.loads(body_json)
+            body_text = json.dumps(obj, ensure_ascii=False)
+            py_body = repr(obj)
+            body_kw = "json"
+        except Exception:
+            body_text = body_json
+            py_body = repr(body_json)
+            body_kw = "data"
+        js_body = "    body: " + _js_str(body_text) + ","
+    elif body_kind == "form-data" and body_form:
+        parts = []
+        for k, v in body_form:
+            parts.append(f"-F '{k}={v}'".replace("'", "'\\''"))
+        body_text = " \\\n  ".join(parts)
+        py_body = repr({k: ("", str(v)) for k, v in body_form})
+        body_kw = "files"
+        lines = ["    const body = new FormData();"]
+        for k, v in body_form:
+            lines.append(f'    body.append({_js_str(k)}, {_js_str(v)});')
+        js_body = "\n".join(lines)
+    elif body_kind == "x-www-form-urlencoded" and body_urlenc:
+        parts = []
+        for k, v in body_urlenc:
+            parts.append("--data-urlencode " + f"'{k}={v}'".replace("'", "'\\''"))
+        body_text = " \\\n  ".join(parts)
+        py_body = repr(dict(body_urlenc))
+        body_kw = "data"
+        js_body = "    body: new URLSearchParams(" + _js_str(json.dumps(dict(body_urlenc), ensure_ascii=False)) + "),"
+
+    # curl
+    lines = [f"curl -X {method} {_quote_shell(url)}"]
+    for k, v in headers.items():
+        lines.append(f"  -H {_quote_shell(f'{k}: {v}')}")
+    if body_text:
+        if body_kind == "form-data":
+            lines.append("  " + body_text)
+        elif body_kind == "x-www-form-urlencoded":
+            lines.append("  " + body_text)
+        else:
+            lines.append("  --data-raw " + _quote_shell(body_text))
+    curl_code = " \\\n".join(lines) + "\n"
+
+    # Python
+    py_lines = [
+        "import requests",
+        "",
+        f"url = {_quote_py(url)}",
+        "headers = " + _pretty_py_dict(headers) if headers else "headers = {}",
+    ]
+    if params:
+        py_lines.append("params = " + repr(dict(params)))
+    if py_body:
+        py_lines.append("payload = " + py_body)
+    py_lines.append("")
+    py_lines.append('resp = requests.request(')
+    py_lines.append(f"    {_quote_py(method)}, url,")
+    py_lines.append("    headers=headers,")
+    if params:
+        py_lines.append("    params=params,")
+    if py_body:
+        py_lines.append(f"    {body_kw}=payload,")
+    py_lines.append("    timeout=30,")
+    py_lines.append(")")
+    py_lines.append("print(resp.status_code)")
+    py_lines.append("print(resp.text)")
+    py_code = "\n".join(py_lines) + "\n"
+
+    # JavaScript
+    js_lines = [
+        f"const url = {_js_str(url)};",
+        "const options = {",
+        f"  method: {_js_str(method)},",
+    ]
+    if headers:
+        js_lines.append("  headers: " + json.dumps(headers, ensure_ascii=False, indent=2).replace("\n", "\n  ") + ",")
+    else:
+        js_lines.append("  headers: {},")
+    if js_body:
+        js_lines.append(js_body)
+    js_lines.append("};")
+    if params:
+        js_lines.append("const params = " + json.dumps(dict(params), ensure_ascii=False) + ";")
+        js_lines.append("options.url = url + '?' + new URLSearchParams(params).toString();")
+        js_lines.append("const resp = await fetch(options.url, options);")
+    else:
+        js_lines.append("const resp = await fetch(url, options);")
+    js_lines.append("const data = await resp.json().catch(() => null);")
+    js_lines.append("console.log(resp.status, data);")
+    js_code = "\n".join(js_lines) + "\n"
+
+    return {"curl": curl_code, "python": py_code, "javascript": js_code}
+
+
+def _quote_shell(text: str) -> str:
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def _quote_py(text: str) -> str:
+    return repr(str(text))
+
+
+def _pretty_py_dict(d: dict) -> str:
+    """headers 用多行 repr，便于阅读。"""
+    if not d:
+        return "{}"
+    return "{\n    " + ",\n    ".join(repr(k) + ": " + repr(v) for k, v in d.items()) + ",\n}"
 
 # --------------------------------------------------------------------------
 # Postman 集合导入 / 导出
@@ -1147,6 +1540,47 @@ class JsonHighlighter(QSyntaxHighlighter):
 
 
 # --------------------------------------------------------------------------
+# 生成代码对话框
+# --------------------------------------------------------------------------
+class CodeGenDialog(QDialog):
+    """展示 curl / Python / JavaScript 三段代码，切换标签即复制对应片段。"""
+
+    def __init__(self, snippets: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("生成代码")
+        self.resize(700, 500)
+        root = QVBoxLayout(self)
+        hint = QLabel("切换标签即自动复制对应代码到剪贴板。")
+        hint.setStyleSheet("color:#888;")
+        root.addWidget(hint)
+        self.tabs = QTabWidget()
+        self._edits = {}
+        for key, label in (("curl", "cURL"), ("python", "Python (requests)"), ("javascript", "JavaScript (fetch)")):
+            edit = QPlainTextEdit()
+            edit.setReadOnly(True)
+            edit.setPlainText(snippets.get(key, ""))
+            edit.setStyleSheet(
+                "font-family: Consolas, 'Courier New', monospace; font-size: 12px;"
+            )
+            self.tabs.addTab(edit, label)
+            self._edits[key] = edit
+        self.tabs.currentChanged.connect(self._copy_current)
+        root.addWidget(self.tabs, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        bb.clicked.connect(self.reject)
+        root.addWidget(bb)
+        self._copy_current(0)
+
+    def _copy_current(self, index: int) -> None:
+        if not (0 <= index < len(self._edits)):
+            return
+        key = list(self._edits.keys())[index]
+        QApplication.clipboard().setText(self._edits[key].toPlainText())
+        self.setWindowTitle("生成代码 · 已复制 " + key.upper())
+
+
+# --------------------------------------------------------------------------
 # 键值表（Query / Headers / form-data / urlencoded 共用）
 # --------------------------------------------------------------------------
 class KeyValueTable(QTableWidget):
@@ -1298,6 +1732,288 @@ class HttpWorker(QThread):
             if "SSL" in type(e).__name__ or "ssl" in msg.lower():
                 msg += "\n提示：可尝试在选项区关闭「验证 SSL 证书」后重试。"
             self.failed.emit(msg)
+
+
+# --------------------------------------------------------------------------
+# 集合运行器
+# --------------------------------------------------------------------------
+def build_payload_from_snapshot(req: dict, variables: dict, timeout: int, verify: bool, allow_redirects: bool) -> dict:
+    """把集合请求快照转换为可发送的 payload（变量替换 + 认证注入）。"""
+    variables = variables or {}
+    method = (req.get("method") or "GET").upper()
+    raw_url = str(req.get("url") or "")
+    url = substitute(raw_url, variables).strip()
+
+    headers = {}
+    for k, v in _enabled_pairs(req.get("headers")):
+        headers[substitute(str(k), variables)] = substitute(str(v), variables)
+
+    params = []
+    for k, v in _enabled_pairs(req.get("params")):
+        params.append((substitute(str(k), variables), substitute(str(v), variables)))
+
+    body_kind = req.get("body_type") or "none"
+    payload = {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "params": params or None,
+        "timeout": timeout,
+        "verify": verify,
+        "allow_redirects": allow_redirects,
+        "data": None,
+        "files": None,
+        "json": None,
+        "requests_auth": None,
+    }
+    if body_kind == "JSON":
+        body_text = substitute(req.get("body_json") or "", variables)
+        if body_text.strip():
+            try:
+                payload["json"] = json.loads(body_text)
+            except Exception:
+                payload["data"] = body_text.encode("utf-8")
+                if not any(k.lower() == "content-type" for k in headers):
+                    headers["Content-Type"] = "application/json"
+    elif body_kind == "form-data":
+        files = {}
+        for k, v in _enabled_pairs(req.get("body_form")):
+            files[substitute(str(k), variables)] = (None, substitute(str(v), variables))
+        if files:
+            payload["files"] = files
+            for k in list(headers):
+                if k.lower() == "content-type":
+                    headers.pop(k)
+    elif body_kind == "x-www-form-urlencoded":
+        data = {}
+        for k, v in _enabled_pairs(req.get("body_urlenc")):
+            data[substitute(str(k), variables)] = substitute(str(v), variables)
+        if data:
+            payload["data"] = data
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    payload["_auth_notes"] = apply_auth(payload, req.get("auth") or default_auth(), variables)
+    payload["_raw_url"] = raw_url
+    return payload
+
+
+def run_assertions_on_ctx(tests, ctx) -> tuple:
+    """对 ctx 运行全部断言，返回 (passed, total, details)。details 为 [(ok, desc)]。"""
+    passed = 0
+    total = 0
+    details = []
+    for t in tests or []:
+        if not isinstance(t, dict):
+            continue
+        atype = str(t.get("atype") or "")
+        if not atype:
+            continue
+        ok, desc = evaluate_assertion(atype, t.get("arg1"), t.get("arg2"), ctx)
+        total += 1
+        if ok:
+            passed += 1
+        details.append((ok, desc))
+    return passed, total, details
+
+
+class CollectionRunner(QThread):
+    """后台顺序执行集合请求，逐条上报结果。"""
+
+    item_done = Signal(dict)
+    all_done = Signal(dict)
+
+    def __init__(self, requests_list, variables, timeout, verify, allow_redirects, parent=None):
+        super().__init__(parent)
+        self._requests = requests_list
+        self._variables = variables or {}
+        self._timeout = timeout
+        self._verify = verify
+        self._allow_redirects = allow_redirects
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:  # noqa: D102
+        total = len(self._requests)
+        success = 0
+        failed = 0
+        for i, req in enumerate(self._requests):
+            if self._stop:
+                break
+            result = {
+                "index": i,
+                "name": str(req.get("name") or req.get("url") or ""),
+                "method": (req.get("method") or "GET").upper(),
+                "url": substitute(str(req.get("url") or ""), self._variables).strip(),
+                "status_code": None,
+                "elapsed_ms": None,
+                "passed": 0,
+                "total": 0,
+                "ok": False,
+                "error": "",
+            }
+            try:
+                payload = build_payload_from_snapshot(
+                    req, self._variables, self._timeout, self._verify, self._allow_redirects
+                )
+                t0 = time.perf_counter()
+                resp = requests.request(
+                    method=payload["method"],
+                    url=payload["url"],
+                    params=payload["params"],
+                    headers=payload["headers"],
+                    data=payload["data"],
+                    json=payload["json"],
+                    files=payload["files"],
+                    auth=payload["requests_auth"],
+                    timeout=payload["timeout"],
+                    verify=payload["verify"],
+                    allow_redirects=payload["allow_redirects"],
+                )
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                try:
+                    json_obj = resp.json()
+                except Exception:
+                    json_obj = None
+                ctx = {"status": resp.status_code, "elapsed_ms": elapsed_ms, "text": resp.text, "json": json_obj}
+                passed, total_n, _details = run_assertions_on_ctx(req.get("tests"), ctx)
+                ok = resp.status_code < 400 and (total_n == 0 or passed == total_n)
+                result.update(
+                    {
+                        "status_code": resp.status_code,
+                        "elapsed_ms": elapsed_ms,
+                        "passed": passed,
+                        "total": total_n,
+                        "ok": ok,
+                    }
+                )
+                if ok:
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as e:  # noqa: BLE001
+                result["error"] = str(e)
+                failed += 1
+            self.item_done.emit(result)
+        self.all_done.emit({"total": total, "success": success, "failed": failed, "stopped": self._stop})
+
+
+class CollectionRunnerDialog(QDialog):
+    """按顺序运行集合内全部请求，实时展示进度，失败项可双击定位。"""
+
+    def __init__(self, requests_list: list, main: "MainWindow", parent=None):
+        super().__init__(parent)
+        self._main = main
+        self._requests = requests_list
+        self._runner = None
+        self.setWindowTitle("运行集合")
+        self.resize(980, 480)
+        root = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        self.progress_label = QLabel("准备运行 %d 个请求…" % len(requests_list))
+        top.addWidget(self.progress_label, 1)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.clicked.connect(self._stop_clicked)
+        top.addWidget(self.stop_btn)
+        root.addLayout(top)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["#", "方法", "名称 / 错误", "URL", "状态码", "耗时", "断言通过"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 40)
+        self.table.setColumnWidth(1, 70)
+        self.table.setColumnWidth(4, 90)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 100)
+        self.table.cellDoubleClicked.connect(self._locate_row)
+        self.table.itemDoubleClicked.connect(lambda it: self._locate_row(it.row(), 0))
+        root.addWidget(self.table, 1)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("font-weight:600;")
+        root.addWidget(self.summary_label)
+
+        self._row_of_index = {}
+
+        self._runner = CollectionRunner(
+            requests_list,
+            self._main.variables(),
+            self._main.timeout_spin.value(),
+            not self._main.verify_chk.isChecked(),
+            self._main.redirect_chk.isChecked(),
+            self,
+        )
+        self._runner.item_done.connect(self._on_item_done)
+        self._runner.all_done.connect(self._on_all_done)
+        self._runner.finished.connect(self._on_runner_finished)
+        self._runner.start()
+
+    def _stop_clicked(self) -> None:
+        if self._runner is not None and self._runner.isRunning():
+            self._runner.stop()
+            self.stop_btn.setEnabled(False)
+            self.progress_label.setText("正在停止…")
+
+    def _on_item_done(self, result: dict) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._row_of_index[result.get("index")] = row
+        idx = result.get("index", row)
+        ok = bool(result.get("ok"))
+
+        def mk(text, color=None):
+            it = QTableWidgetItem(text)
+            it.setData(Qt.ItemDataRole.UserRole, idx)
+            if color:
+                it.setForeground(QBrush(QColor(color)))
+            return it
+
+        self.table.setItem(row, 0, mk(str(idx + 1)))
+        self.table.setItem(row, 1, mk(result.get("method") or "", "#5aa9f0"))
+        name_text = result.get("name") or ""
+        if result.get("error"):
+            name_text = "失败：" + result["error"]
+        self.table.setItem(row, 2, mk(name_text, "#f05f5f" if result.get("error") else None))
+        self.table.setItem(row, 3, mk(result.get("url") or ""))
+        code = result.get("status_code")
+        if code is None:
+            self.table.setItem(row, 4, mk("ERR", "#f05f5f"))
+        else:
+            self.table.setItem(row, 4, mk(str(code), STATUS_COLORS.get(str(code)[0], "#8d949c")))
+        ms = result.get("elapsed_ms")
+        self.table.setItem(row, 5, mk(fmt_ms(ms) if ms is not None else "-"))
+        passed = result.get("passed", 0)
+        total_n = result.get("total", 0)
+        ast_text = f"{passed}/{total_n}" if total_n else "-"
+        self.table.setItem(row, 6, mk(ast_text, "#3ecf8e" if total_n and passed == total_n else ("#f0a45d" if total_n else None)))
+        self.progress_label.setText("已完成 %d/%d 个请求…" % (row + 1, len(self._requests)))
+
+    def _on_all_done(self, summary: dict) -> None:
+        if summary.get("stopped"):
+            self.summary_label.setText("已停止：成功 %d / 失败 %d（共 %d 个）" % (summary["success"], summary["failed"], summary["total"]))
+        else:
+            self.summary_label.setText("运行结束：成功 %d / 失败 %d（共 %d 个）" % (summary["success"], summary["failed"], summary["total"]))
+
+    def _on_runner_finished(self) -> None:
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setText("完成")
+
+    def _locate_row(self, row: int, _col: int) -> None:
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or not (0 <= idx < len(self._requests)):
+            return
+        req = self._requests[idx]
+        self._main._new_request_tab(req)
+        self._main.status_msg("已在新标签页定位：" + (req.get("name") or ""))
 
 
 # --------------------------------------------------------------------------
@@ -1508,6 +2224,11 @@ class RequestTab(QWidget):
         self.save_btn.setFixedWidth(110)
         self.save_btn.clicked.connect(lambda: self._main.save_to_collection(self))
         top.addWidget(self.save_btn)
+
+        self.code_btn = QPushButton("生成代码")
+        self.code_btn.setFixedWidth(96)
+        self.code_btn.clicked.connect(self._show_codegen)
+        top.addWidget(self.code_btn)
         root.addLayout(top)
 
         # 主体：请求详情 + 响应
@@ -1665,6 +2386,94 @@ class RequestTab(QWidget):
             "本地用密钥对 Payload 现场签发 JWT（HS256/HS384/HS512）。"
             "iat / exp 等声明请自行写在 Payload 里。",
         )
+
+        # 7 OAuth 2.0
+        self.auth_oauth2_grant = QComboBox()
+        for gk, gl in OAUTH2_GRANTS:
+            self.auth_oauth2_grant.addItem(gl, gk)
+        self.auth_oauth2_token_url = QLineEdit()
+        self.auth_oauth2_token_url.setPlaceholderText("https://auth.example.com/oauth/token")
+        self.auth_oauth2_client_id = QLineEdit()
+        self.auth_oauth2_client_secret = QLineEdit()
+        self.auth_oauth2_client_secret.setPlaceholderText("Client Secret")
+        self.auth_oauth2_username = QLineEdit()
+        self.auth_oauth2_username.setPlaceholderText("Password 模式使用")
+        self.auth_oauth2_password = QLineEdit()
+        self.auth_oauth2_password.setPlaceholderText("Password 模式使用")
+        self.auth_oauth2_scope = QLineEdit()
+        self.auth_oauth2_scope.setPlaceholderText("可选，空格分隔多个 scope")
+        self.auth_oauth2_extra = QLineEdit()
+        self.auth_oauth2_extra.setPlaceholderText('可选 JSON，如 {"audience": "api"}')
+        self.auth_oauth2_authorize_url = QLineEdit()
+        self.auth_oauth2_authorize_url.setPlaceholderText("https://auth.example.com/oauth/authorize")
+        self.auth_oauth2_redirect_uri = QLineEdit()
+        self.auth_oauth2_redirect_uri.setPlaceholderText("https://client.example.com/callback")
+        self.auth_oauth2_code = QLineEdit()
+        self.auth_oauth2_code.setPlaceholderText("授权码（可自动获取，也可粘贴回调地址后提取）")
+        self.auth_oauth2_access_token = QLineEdit()
+        self.auth_oauth2_access_token.setPlaceholderText("手动粘贴 access_token（可选，留空则自动获取）")
+        self.auth_oauth2_refresh_token = QLineEdit()
+        self.auth_oauth2_refresh_token.setPlaceholderText("手动粘贴 refresh_token（可选）")
+        self.auth_oauth2_auto = QCheckBox("过期后自动刷新（需要 refresh_token）")
+        self.auth_oauth2_auto.stateChanged.connect(self._mark_dirty)
+        self.auth_oauth2_auto.stateChanged.connect(self._on_auth_changed)
+        oauth_page = QWidget()
+        of = QFormLayout(oauth_page)
+        of.setContentsMargins(6, 6, 6, 6)
+        of.setLabelAlignment(Qt.AlignRight)
+        of.addRow("授权流程：", self.auth_oauth2_grant)
+        self._bind_auth("oauth2.grant_type", self.auth_oauth2_grant)
+        of.addRow("Token URL：", self.auth_oauth2_token_url)
+        self._bind_auth("oauth2.token_url", self.auth_oauth2_token_url)
+        of.addRow("Client ID：", self.auth_oauth2_client_id)
+        self._bind_auth("oauth2.client_id", self.auth_oauth2_client_id)
+        of.addRow("Client Secret：", self.auth_oauth2_client_secret)
+        self._bind_auth("oauth2.client_secret", self.auth_oauth2_client_secret, True)
+        of.addRow("用户名：", self.auth_oauth2_username)
+        self._bind_auth("oauth2.username", self.auth_oauth2_username)
+        of.addRow("密码：", self.auth_oauth2_password)
+        self._bind_auth("oauth2.password", self.auth_oauth2_password, True)
+        of.addRow("Scope：", self.auth_oauth2_scope)
+        self._bind_auth("oauth2.scope", self.auth_oauth2_scope)
+        of.addRow("额外参数(JSON)：", self.auth_oauth2_extra)
+        self._bind_auth("oauth2.extra", self.auth_oauth2_extra)
+        of.addRow("授权 URL：", self.auth_oauth2_authorize_url)
+        self._bind_auth("oauth2.authorize_url", self.auth_oauth2_authorize_url)
+        of.addRow("回调地址：", self.auth_oauth2_redirect_uri)
+        self._bind_auth("oauth2.redirect_uri", self.auth_oauth2_redirect_uri)
+        of.addRow("授权码：", self.auth_oauth2_code)
+        self._bind_auth("oauth2.authorization_code", self.auth_oauth2_code)
+        b_auth = QPushButton("获取授权码并打开浏览器")
+        b_auth.clicked.connect(self._oauth2_authorize)
+        b_paste = QPushButton("粘贴回调地址提取授权码")
+        b_paste.clicked.connect(self._oauth2_paste_callback)
+        auth_btns = QHBoxLayout()
+        auth_btns.addWidget(b_auth)
+        auth_btns.addWidget(b_paste)
+        of.addRow("", auth_btns)
+        of.addRow("Access Token：", self.auth_oauth2_access_token)
+        self._bind_auth("oauth2.access_token", self.auth_oauth2_access_token, True)
+        of.addRow("Refresh Token：", self.auth_oauth2_refresh_token)
+        self._bind_auth("oauth2.refresh_token", self.auth_oauth2_refresh_token, True)
+        of.addRow("", self.auth_oauth2_auto)
+        b_refresh = QPushButton("手动刷新 Token")
+        b_refresh.clicked.connect(self._oauth2_refresh_now)
+        b_clear = QPushButton("清除 Token")
+        b_clear.clicked.connect(self._oauth2_clear_token)
+        tk_btns = QHBoxLayout()
+        tk_btns.addWidget(b_refresh)
+        tk_btns.addWidget(b_clear)
+        of.addRow("", tk_btns)
+        lab_hint = QLabel(
+            "Client Credentials / Password 模式在发送请求时自动向 Token URL 换取 access_token "
+            "并附加 Bearer；Authorization Code 模式先获取授权码，发送时用授权码换 token。"
+            "获取到的 token 随请求快照持久化，可用「手动刷新 Token」刷新。"
+        )
+        lab_hint.setWordWrap(True)
+        lab_hint.setStyleSheet(self._hint_style())
+        of.addRow(lab_hint)
+        self._auth_hints.append(lab_hint)
+        self.auth_stack.addWidget(oauth_page)
 
         av.addWidget(self.auth_stack)
 
@@ -1940,6 +2749,54 @@ class RequestTab(QWidget):
         for widget in self._auth_secret_widgets:
             widget.setEchoMode(mode)
 
+    # ---- OAuth 2.0 面板操作 ----
+    def _oauth2_authorize(self) -> None:
+        self._sync_auth_from_ui()
+        url = oauth2_build_authorize_url(self.auth["oauth2"], self._main.variables())
+        if not url:
+            QMessageBox.information(self, "提示", "请先填写授权 URL（Authorization URL）。")
+            return
+        QApplication.clipboard().setText(url)
+        self._main.status_msg("授权 URL 已复制到剪贴板，正在打开浏览器…")
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _oauth2_paste_callback(self) -> None:
+        self._sync_auth_from_ui()
+        text = QApplication.clipboard().text() or ""
+        code, ok = QInputDialog.getText(
+            self, "粘贴回调地址", "粘贴授权后的回调地址（应包含 code=…）：", text=text
+        )
+        if not ok:
+            return
+        code_val = oauth2_extract_code(code)
+        if not code_val:
+            QMessageBox.warning(self, "提示", "未从回调地址中提取到 code 参数。")
+            return
+        self.auth["oauth2"]["authorization_code"] = code_val
+        self._auth_set_widget_value(self.auth_oauth2_code, code_val)
+        self._update_auth_preview()
+        self._mark_dirty()
+        self._main.status_msg("已提取授权码：" + mask_secret(code_val))
+
+    def _oauth2_refresh_now(self) -> None:
+        self._sync_auth_from_ui()
+        token_dict, err = oauth2_refresh_token(self.auth["oauth2"], self._main.variables())
+        if err:
+            QMessageBox.warning(self, "刷新失败", err)
+            return
+        _oauth2_save_token(self.auth["oauth2"], token_dict)
+        self.set_auth(self.auth)
+        self._main.status_msg("Token 已刷新并写入当前请求配置。")
+
+    def _oauth2_clear_token(self) -> None:
+        self._sync_auth_from_ui()
+        self.auth["oauth2"]["access_token"] = ""
+        self.auth["oauth2"]["refresh_token"] = ""
+        self.auth["oauth2"]["expires_at"] = 0
+        self.auth["oauth2"]["authorization_code"] = ""
+        self.set_auth(self.auth)
+        self._main.status_msg("已清除 OAuth 2.0 Token。")
+
     def _on_auth_type_changed(self, index: int) -> None:
         if 0 <= index < self.auth_stack.count():
             self.auth_stack.setCurrentIndex(index)
@@ -1983,6 +2840,8 @@ class RequestTab(QWidget):
         for path, widget in self._auth_bindings:
             section, _, field = path.partition(".")
             auth.setdefault(section, {})[field] = self._auth_widget_value(widget)
+        if hasattr(self, "auth_oauth2_auto"):
+            auth["oauth2"]["auto_refresh"] = bool(self.auth_oauth2_auto.isChecked())
         self.auth = auth
 
     def auth_snapshot(self) -> dict:
@@ -1998,6 +2857,11 @@ class RequestTab(QWidget):
         self.auth_type.setCurrentIndex(index)
         self.auth_type.blockSignals(False)
         self.auth_stack.setCurrentIndex(index)
+        if hasattr(self, "auth_oauth2_auto"):
+            oauth = auth.get("oauth2", {})
+            self.auth_oauth2_auto.blockSignals(True)
+            self.auth_oauth2_auto.setChecked(bool(oauth.get("auto_refresh")))
+            self.auth_oauth2_auto.blockSignals(False)
         self.auth = auth
         self._update_auth_preview()
 
@@ -2018,6 +2882,7 @@ class RequestTab(QWidget):
             "files": None,
             "json": None,
             "requests_auth": None,
+            "_preview": True,
         }
         try:
             notes = apply_auth(probe, auth, self._main.variables())
@@ -2082,6 +2947,16 @@ class RequestTab(QWidget):
     # ------------------------------------------------------------------
     # 发送请求
     # ------------------------------------------------------------------
+    def _show_codegen(self) -> None:
+        try:
+            req = self.snapshot()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "生成代码", "获取请求配置失败：" + str(e))
+            return
+        snippets = generate_code_snippets(req, self._main.variables())
+        dlg = CodeGenDialog(snippets, self)
+        dlg.exec()
+
     def _collect_request(self) -> dict:
         variables = self._main.variables()
         method = self.method_combo.currentText()
@@ -2686,9 +3561,14 @@ class MainWindow(QMainWindow):
         b_exp.clicked.connect(self.export_postman)
         b_sel = QPushButton("导出选中请求")
         b_sel.clicked.connect(self.export_postman_request)
+        b_run = QPushButton("运行集合")
+        b_run.setObjectName("primary")
+        b_run.clicked.connect(self.run_collection)
+        self.run_coll_btn = b_run
         coll_bar.addWidget(b_imp)
         coll_bar.addWidget(b_exp)
         coll_bar.addWidget(b_sel)
+        coll_bar.addWidget(b_run)
         cv.addLayout(coll_bar)
         cv.addWidget(self.coll_tree, 1)
         left.addTab(coll_wrap, "集合")
@@ -3152,6 +4032,24 @@ class MainWindow(QMainWindow):
                 self._rebuild_collections()
                 self.status_msg("已删除集合条目")
 
+    def run_collection(self) -> None:
+        requests_list = self._collect_request_nodes(self.state.get("collections", []))
+        if not requests_list:
+            QMessageBox.information(self, "运行集合", "集合中没有可运行的请求。请先在集合中保存请求。")
+            return
+        dlg = CollectionRunnerDialog(requests_list, self, self)
+        dlg.exec()
+
+    @staticmethod
+    def _collect_request_nodes(nodes) -> list:
+        out = []
+        for n in nodes or []:
+            if n.get("type") == "request":
+                out.append(n)
+            else:
+                out.extend(MainWindow._collect_request_nodes(n.get("children", [])))
+        return out
+
     # ------------------------------------------------------------------
     # Postman 导入 / 导出
     # ------------------------------------------------------------------
@@ -3430,6 +4328,100 @@ def run_self_test() -> None:
         ok = False
         lines.append("assert/extract error: " + repr(e))
 
+    # OAuth 2.0 纯逻辑（不触发网络）
+    try:
+        ou = oauth2_build_authorize_url(
+            {
+                "authorize_url": "https://auth.example.com/authorize",
+                "client_id": "cid123",
+                "redirect_uri": "http://localhost:8080/cb",
+                "scope": "read write",
+                "extra": "",
+                "access_token": "",
+            },
+            {},
+        )
+        ou_ok = ou is not None and "client_id=cid123" in ou and "response_type=code" in ou
+        ec1 = oauth2_extract_code("https://localhost/cb?code=ABC123&state=x")
+        ec2 = oauth2_extract_code("https://localhost/cb?state=x")
+        ec_ok = ec1 == "ABC123" and ec2 == ""
+        _tok, rerr = oauth2_refresh_token({"refresh_token": ""}, {})
+        ref_ok = rerr is not None and "refresh_token" in rerr
+        oauth_ok = ou_ok and ec_ok and ref_ok
+        lines.append("oauth2 authorize url: " + ("ok" if ou_ok else "FAIL " + str(ou)))
+        lines.append("oauth2 extract code: " + ("ok" if ec_ok else "FAIL"))
+        lines.append("oauth2 refresh guard: " + ("ok" if ref_ok else "FAIL"))
+        ok = ok and oauth_ok
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("oauth2 error: " + repr(e))
+
+    # 代码生成纯逻辑
+    try:
+        gen_req = {
+            "method": "POST",
+            "url": "https://api.example.com/login?env=prod",
+            "params": [{"key": "debug", "value": "1", "enabled": True}],
+            "headers": [{"key": "X-Token", "value": "abc", "enabled": True}],
+            "body_type": "JSON",
+            "body_json": '{"user":"alice","pwd":"123"}',
+            "body_form": [],
+            "body_urlenc": [],
+            "auth": bearer_auth("tok123"),
+        }
+        snips = generate_code_snippets(gen_req, {})
+        curl_s = snips["curl"]
+        py_s = snips["python"]
+        js_s = snips["javascript"]
+        cg_ok = (
+            "curl" in snips
+            and "-X POST" in curl_s
+            and "Bearer tok123" in curl_s
+            and "--data-raw" in curl_s
+            and "requests.request" in py_s
+            and "'user': 'alice'" in py_s
+            and "fetch(" in js_s
+            and "Bearer tok123" in js_s
+            and "debug=1" in curl_s
+        )
+        lines.append("codegen curl/python/js: " + ("ok" if cg_ok else "FAIL"))
+        ok = ok and cg_ok
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("codegen error: " + repr(e))
+
+    # 集合运行器纯逻辑（payload 构建 + 断言统计）
+    try:
+        snap = {
+            "method": "GET",
+            "url": "{{base}}/ping",
+            "params": [{"key": "x", "value": "{{v}}", "enabled": True}],
+            "headers": [],
+            "body_type": "none",
+            "body_json": "",
+            "body_form": [],
+            "body_urlenc": [],
+            "auth": bearer_auth("tok99"),
+        }
+        pl = build_payload_from_snapshot(snap, {"base": "https://httpbin.org", "v": "42"}, 30, True, True)
+        runner_ok = pl["url"] == "https://httpbin.org/ping" and pl["params"] == [("x", "42")]
+        runner_ok = runner_ok and pl["headers"].get("Authorization") == "Bearer tok99"
+        passed, total_n, _det = run_assertions_on_ctx(
+            [{"atype": "status_eq", "arg1": "200", "arg2": ""}, {"atype": "json_exists", "arg1": "$.ok", "arg2": ""}],
+            {"status": 200, "elapsed_ms": 100, "text": '{"ok":true}', "json": {"ok": True}},
+        )
+        runner_ok = runner_ok and passed == 2 and total_n == 2
+        passed2, total2, _d = run_assertions_on_ctx(
+            [{"atype": "status_eq", "arg1": "404", "arg2": ""}],
+            {"status": 200, "elapsed_ms": 100, "text": "", "json": None},
+        )
+        runner_ok = runner_ok and passed2 == 0 and total2 == 1
+        lines.append("collection runner logic: " + ("ok" if runner_ok else "FAIL"))
+        ok = ok and runner_ok
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("collection runner error: " + repr(e))
+
     # UI 冒烟：多标签 / 主题 / 历史过滤（离屏）
     try:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -3468,6 +4460,23 @@ def run_self_test() -> None:
         smoke_tests = tab0.tests_table.rowCount() == 2 and tab0.extract_table.rowCount() == 1
         lines.append(f"ui tests tab: rows={tab0.tests_table.rowCount()}/{tab0.extract_table.rowCount()} env_extract={smoke_env}")
         ok = ok and smoke_env and smoke_tests
+        # OAuth 2.0 面板注册 + 代码生成按钮 + 集合运行按钮
+        oauth_panel = (
+            tab0.auth_type.count() == 8
+            and tab0.auth_stack.count() == 8
+            and "OAuth 2.0" in [tab0.auth_type.itemText(i) for i in range(tab0.auth_type.count())]
+        )
+        code_btn_ok = hasattr(tab0, "code_btn") and tab0.code_btn.text() == "生成代码"
+        run_btn_ok = hasattr(win, "run_coll_btn") and win.run_coll_btn.text() == "运行集合"
+        oauth_preview = ""
+        try:
+            oauth_preview = tab0.auth_preview.text()
+        except Exception:
+            pass
+        lines.append(f"ui oauth panel: pages={tab0.auth_stack.count()} types={tab0.auth_type.count()} oauth={oauth_panel}")
+        lines.append(f"ui codegen btn: {code_btn_ok}")
+        lines.append(f"ui run-coll btn: {run_btn_ok}")
+        ok = ok and oauth_panel and code_btn_ok and run_btn_ok
         win.close()
         good_ui = (
             added == base + 2
@@ -3582,6 +4591,32 @@ def run_ui_shot(out_dir: str, theme_name: str = None) -> None:
                         }
                     ),
                 ),
+                (
+                    "auth_oauth2.png",
+                    merge_auth(
+                        {
+                            "type": "oauth2",
+                            "oauth2": {
+                                "grant_type": "client_credentials",
+                                "token_url": "https://auth.example.com/oauth/token",
+                                "client_id": "demo-client",
+                                "client_secret": "demo-secret",
+                                "username": "",
+                                "password": "",
+                                "scope": "read write",
+                                "extra": "",
+                                "authorize_url": "https://auth.example.com/authorize",
+                                "redirect_uri": "http://localhost:8080/cb",
+                                "authorization_code": "",
+                                "access_token": "tk-cached-12345",
+                                "refresh_token": "rt-cached-67890",
+                                "token_type": "Bearer",
+                                "auto_refresh": True,
+                                "expires_at": 0,
+                            },
+                        }
+                    ),
+                ),
             ]
             for name, cfg in shots:
                 tab.set_auth(cfg)
@@ -3626,6 +4661,50 @@ def run_ui_shot(out_dir: str, theme_name: str = None) -> None:
             qapp.processEvents()
             saved = win.grab().save(os.path.join(out_dir, f"{theme}_tests.png"))
             lines.append(f"[{theme}] tests saved={saved} rows={tab.tests_table.rowCount()}/{tab.extract_table.rowCount()}")
+            # 代码生成对话框
+            try:
+                tab = win._tabs[0]
+                tab.set_auth(bearer_auth("tk-shot-abc"))
+                tab.method_combo.setCurrentText("POST")
+                tab.url_edit.setText("https://api.example.com/v1/orders")
+                req = tab.snapshot()
+                snips = generate_code_snippets(req, win.variables())
+                dlg = CodeGenDialog(snips, win)
+                dlg.resize(700, 480)
+                dlg.show()
+                qapp.processEvents()
+                saved = dlg.grab().save(os.path.join(out_dir, f"{theme}_codegen.png"))
+                lines.append(f"[{theme}] codegen saved={saved} tabs={dlg.tabs.count()} first_len={len(snips['curl'])}")
+                dlg.close()
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"[{theme}] codegen error: {repr(e)}")
+            # 集合运行器对话框（静态空集合冒烟，不触发网络）
+            try:
+                empty_req = {
+                    "name": "Demo GET",
+                    "method": "GET",
+                    "url": "https://httpbin.org/get",
+                    "params": [],
+                    "headers": [],
+                    "body_type": "none",
+                    "body_json": "",
+                    "body_form": [],
+                    "body_urlenc": [],
+                    "auth": default_auth(),
+                    "tests": [{"atype": "status_eq", "arg1": "200", "arg2": ""}],
+                }
+                runner_dlg = CollectionRunnerDialog([empty_req], win, win)
+                runner_dlg.resize(980, 460)
+                runner_dlg.show()
+                qapp.processEvents()
+                saved = runner_dlg.grab().save(os.path.join(out_dir, f"{theme}_runner.png"))
+                lines.append(f"[{theme}] runner saved={saved} cols={runner_dlg.table.columnCount()} rows={runner_dlg.table.rowCount()}")
+                runner_dlg.close()
+                if runner_dlg._runner is not None and runner_dlg._runner.isRunning():
+                    runner_dlg._runner.stop()
+                    runner_dlg._runner.wait(6000)
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"[{theme}] runner error: {repr(e)}")
             win.close()
     except Exception as e:  # noqa: BLE001
         lines.append("ui-shot error: " + repr(e))

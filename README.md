@@ -29,6 +29,11 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
   - `form-data`：表单上传
   - `x-www-form-urlencoded`：URL 编码表单
 
+### 生成代码
+- 请求构建区顶部新增「**生成代码**」按钮，一键把当前请求（方法、URL、Query 参数、Headers、Body、认证配置）转成三种代码片段
+- 支持 `cURL` / `Python (requests)` / `JavaScript (fetch)` 三标签展示，**切换标签自动复制到剪贴板**，可直接粘贴到终端或代码库
+- 认证信息按当前配置真实写入（Bearer / Basic / API Key / AWS v4 / JWT 均生成对应头或参数；OAuth 2.0 使用已缓存 token），变量按当前环境展开
+
 ### 多标签页
 - 同时打开多个请求标签，每个标签都是一套**完整且独立**的请求上下文（方法、URL、Query、Headers、Body、认证配置、响应区）
 - 顶部「＋」新建标签；标签页右侧关闭按钮或 `Ctrl+W` 关闭当前标签
@@ -62,6 +67,11 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 - **集合**以树形结构管理（文件夹 / 请求），支持新建、重命名、删除、右键发送
 - 请求可一键「保存到集合」（快捷键 `Ctrl+S`），完整保留方法、地址、参数、请求头、Body 与认证配置
 
+### 集合运行器
+- 集合面板顶部新增「**运行集合**」按钮，按顺序执行集合内全部请求（嵌套文件夹递归展开）
+- 执行期间**实时**更新每个请求的方法、URL、状态码、耗时、断言通过率，支持中途「停止」
+- 结束后汇总**成功 / 失败**统计（按 2xx 判定成功，断言失败同样计入失败），失败项**双击可定位**到对应请求标签，便于复现调试
+
 ### 主题（深色 / 浅色）
 - 设置区提供「深色」/「浅色」主题下拉切换，选择即时生效并**持久化**到 `workspace.json`，下次启动自动恢复
 - 全部界面元素适配深色：主窗口、请求编辑区、表格、标签页、菜单、认证面板、JSON 高亮、状态徽章等
@@ -73,7 +83,7 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 - 变量可单独取消勾选以临时停用
 - 内置 `默认环境`（`base_url=https://httpbin.org`）与 `本地调试` 两个示例环境
 
-### 认证方式（7 种，均真实作用于请求并随请求存入历史与集合）
+### 认证方式（8 种，均真实作用于请求并随请求存入历史与集合）
 
 | 认证方式 | 说明 | 主要字段 |
 | --- | --- | --- |
@@ -84,11 +94,22 @@ HttpLite 面向日常接口调试场景：不想启动笨重的客户端，也�
 | API Key | 将 Key/Value 附加为请求头或查询参数 | Key 名称、Value、添加到（Header / Query 参数） |
 | AWS Signature v4 | 按 AWS4-HMAC-SHA256 对当前方法 / 地址 / 查询串 / 请求体现场签名，自动写入 `X-Amz-Date` 与 `Authorization` 头 | Access Key、Secret Key、Session Token（可选）、Region、Service |
 | JWT | 本地用密钥现场签发 JWT，支持 `HS256` / `HS384` / `HS512` / `none` | 算法、Secret、Payload、添加到（Header / Query 参数）、名称、前缀 |
+| OAuth 2.0 | 按授权流程获取 `access_token` 并以 `Bearer` 自动附加请求，支持手动刷新 | 见下表 |
 
 - 认证面板支持「显示密钥」开关，默认对密钥类字段做掩码显示
 - 面板底部提供实时**认证预览**，随方法 / 地址 / 环境变化同步更新
 - 敏感字段支持 `{{变量}}` 占位，密钥不必硬编码在请求里
 - JWT 的 `iat` / `exp` 等声明请直接写在 Payload 中；AWS Signature v4 调用 API Gateway 时 `Service` 常用 `execute-api`
+
+#### OAuth 2.0 说明
+
+- 支持三种授权流程（Grant Type）：
+  - **Client Credentials（客户端凭证）**：`client_id` + `client_secret` 换取 token，适合服务端到服务端调用
+  - **Password（密码模式）**：`username` + `password` 换取 token，适合受信客户端
+  - **Authorization Code（授权码模式）**：点击「获取授权」复制授权 URL 并打开浏览器，授权后把回调地址粘贴回输入框自动提取 `code` 换取 token（也可直接手动填入 `authorization_code`）
+- 获取到的 `access_token` / `refresh_token` 缓存在请求配置中并随请求持久化到历史 / 集合，发送时自动以 `Authorization: Bearer <token>` 附加
+- 支持**手动刷新**（按钮「刷新 Token」，要求服务器支持 refresh_token）与「自动刷新」开关（token 过期或缺失时自动用 refresh_token 换取新 token）
+- Token URL / 授权 URL / 客户端信息均支持 `{{变量}}` 占位
 
 ### 便携与数据安全
 - 单文件 exe，免安装、不写注册表
@@ -136,7 +157,10 @@ python app.py
 5. 需要自动校验响应时，切到「测试」标签添加断言（如状态码 `2xx`、`body 包含 success`）；需要把响应里的 `token` 等值带进后续请求时，在「变量提取」中填变量名与 JSON 路径 / 正则，发送后自动写入当前环境
 6. 需要复用请求时点「保存到集合」（或 `Ctrl+S`），之后从左侧集合树双击 / 右键即可再次调用
 7. 从 Postman 迁移：集合面板点「导入 Postman」选 v2.1 导出文件；分享给 Postman 用户：选中集合文件夹点「导出 Postman」（或右键选中请求点「导出选中请求」）
-8. 所有改动（历史、集合、环境、设置）都会自动持久化到数据目录
+8. 需要 OAuth 2.0 认证时：认证方式选「OAuth 2.0」，按 Grant Type 填好 Token URL / 客户端信息后点「获取 Token」（Authorization Code 先「获取授权」在浏览器授权并把回调地址粘贴回「授权码」框），发送时自动附带 Bearer token；token 过期可点「刷新 Token」或打开「自动刷新」
+9. 需要把当前请求分享为代码：点「生成代码」，在 cURL / Python / JavaScript 三个标签间切换，切换时自动复制，直接粘贴使用
+10. 需要批量跑集合：集合面板点「运行集合」，实时查看每个请求的方法 / URL / 状态码 / 耗时 / 断言通过率，结束后查看成功失败统计，失败项双击跳转到对应请求
+11. 所有改动（历史、集合、环境、设置）都会自动持久化到数据目录
 
 ---
 
@@ -164,8 +188,8 @@ pyinstaller HttpLite.spec
 exe 内置两个免交互自检开关，便于确认打包产物在 frozen 环境下能力正常：
 
 ```bash
-HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON / 认证向量 / Postman 导入导出 / 断言与提取 / UI 冒烟，结果写入 exe 同级的 HttpLite_selftest.txt
-HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（认证面板 / 多标签 / 历史过滤 / 测试断言），默认深色
+HttpLite.exe --self-test            # 校验 HTTP / SSL / JSON / 认证向量（含 OAuth 2.0 逻辑）/ Postman 导入导出 / 断言与提取 / 代码生成 / 集合运行器 / UI 冒烟，结果写入 exe 同级的 HttpLite_selftest.txt
+HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（认证面板含 OAuth 2.0 / 多标签 / 历史过滤 / 测试断言 / 代码生成 / 集合运行器），默认深色
 ```
 
 ---
@@ -175,6 +199,9 @@ HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（�
 - **语言**：Python 3.11
 - **GUI**：PySide6（Qt for Python），单窗口 + 多标签页布局，`QSyntaxHighlighter` 实现 JSON 高亮，内置深 / 浅两套 QSS 主题并支持运行时切换
 - **Postman 互通**：Collection v2.1 JSON 解析 / 生成（URL、Headers、Body、认证、文件夹树），支持极简 JSON 路径与正则表达式断言 / 提取
+- **代码生成**：请求一键转 cURL / Python(requests) / JavaScript(fetch) 三语言片段，自动复制到剪贴板
+- **集合运行器**：集合内请求顺序批量执行，实时展示状态 / 耗时 / 断言通过率并汇总统计，失败项可跳转定位
+- **OAuth 2.0**：Client Credentials / Password / Authorization Code 三种授权流程，token 自动以 Bearer 附加，支持手动刷新与自动刷新
 - **网络**：requests（含 `HTTPDigestAuth`），请求在独立 `QThread` 中执行，避免阻塞界面
 - **认证签名**：标准库 `hmac` / `hashlib` / `base64` 手写实现 AWS Signature v4 与 JWT 签发
 - **数据持久化**：单个 `workspace.json` 文件
