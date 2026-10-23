@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run self-test
+        run: python app.py --self-test
+        shell: powershell
+
+      - name: Build single-file exe
+        run: python -m PyInstaller --noconfirm --clean HttpLite.spec
+        shell: powershell
+
+      - name: Verify artifact
+        run: |
+          if (Test-Path dist/HttpLite.exe) { Write-Output "EXE_OK" } else { throw "HttpLite.exe not found" }
+          Get-Item dist/HttpLite.exe | Select-Object Length
+        shell: powershell
+
+      - name: Create / update GitHub Release and upload exe
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes --repo "${{ github.repository }}" 2>$null; exit 0
+          gh release create "${{ github.ref_name }}" dist/HttpLite.exe `
+            --repo "${{ github.repository }}" `
+            --title "HttpLite ${{ github.ref_name }}" `
+            --notes "HttpLite ${{ github.ref_name }} 单文件 Windows 可执行程序。"
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

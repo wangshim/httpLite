@@ -232,11 +232,29 @@ HttpLite.exe --ui-shot <输出目录> [dark|light]   # 离屏渲染并截图（�
 
 ```
 httplite-src/
-├── app.py               # 主程序（单文件源码，含界面、请求、认证、持久化与自检逻辑）
-├── HttpLite.spec        # PyInstaller 打包配置
-├── HttpLite.ico         # 应用图标
-├── README.md            # 本文件
-├── LICENSE              # MIT 许可证
+├── app.py                        # 程序入口（--self-test / --ui-shot）
+├── httplite/                     # 核心包（按职责拆分）
+│   ├── __init__.py               # 包初始化
+│   ├── constants.py              # 常量：HTTP 方法、认证类型、断言/提取类型、主题色、OAuth 2.0 配置
+│   ├── utils.py                  # 通用工具：变量替换、JSON 美化、时间/大小格式化
+│   ├── persistence.py            # 持久化：app_dir、workspace.json 原子读写
+│   ├── auth.py                   # 认证内核：Bearer / Basic / Digest / API Key / AWS v4 / JWT / OAuth 2.0
+│   ├── protocol.py               # WebSocket 帧解析 / SSE 行解析
+│   ├── updater.py                # 内置更新检查（GitHub Releases）
+│   ├── postman.py                # Postman Collection v2.1 导入 / 导出
+│   ├── assertions.py             # 响应断言与变量提取
+│   ├── codegen.py                # 代码生成：curl / Python / JavaScript
+│   ├── workers.py                # 后台线程：HTTP / WebSocket / SSE / 更新检查 / 集合运行器
+│   ├── ui.py                     # 界面层：主窗口、请求标签、WebSocket/SSE 面板与对话框
+│   └── selftest.py               # 自检与离屏截图
+├── .github/
+│   └── workflows/
+│       └── release.yml           # GitHub Actions 自动发布（v* tag 触发）
+├── requirements.txt              # Python 依赖
+├── HttpLite.spec                 # PyInstaller 打包配置
+├── HttpLite.ico                  # 应用图标
+├── README.md                     # 本文件
+├── LICENSE                       # MIT 许可证
 └── .gitignore
 ```
 
