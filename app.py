@@ -9,10 +9,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
+import socket
+import ssl
+import struct
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -27,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     pass
 
-from PySide6.QtCore import Qt, QThread, Signal, QRegularExpression, QSize, QUrl
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, QRegularExpression, QSize, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -80,6 +85,10 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "HttpLite"
 APP_TITLE = "HttpLite · 轻量接口测试工具"
+CURRENT_VERSION = "1.6.0"
+GITHUB_REPO = "wangshim/httpLite"
+GITHUB_REPO_URL = "https://github.com/" + GITHUB_REPO
+GITHUB_RELEASES_API = "https://api.github.com/repos/" + GITHUB_REPO + "/releases/latest"
 METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 VAR_RX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
@@ -183,7 +192,13 @@ def default_state() -> dict:
             },
         ],
         "active_env": "默认环境",
-        "settings": {"timeout": 30, "verify": True, "follow_redirects": True, "theme": "dark"},
+        "settings": {
+            "timeout": 30,
+            "verify": True,
+            "follow_redirects": True,
+            "theme": "dark",
+            "check_update_on_start": True,
+        },
     }
 
 
@@ -802,6 +817,289 @@ def apply_auth(payload: dict, auth: dict, variables: dict) -> list:
 
     payload["params"] = params or None
     return notes
+
+
+# --------------------------------------------------------------------------
+# WebSocket 客户端（自实现 RFC 6455：握手 / 帧编解码，无第三方依赖）
+# --------------------------------------------------------------------------
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept_key(key: str) -> str:
+    """RFC 6455 Sec-WebSocket-Accept 计算：base64(sha1(key + GUID))。"""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+
+
+def ws_build_frame(opcode: int, payload: bytes, mask: bool = True, mask_key: bytes = b"") -> bytes:
+    """构造 WebSocket 数据帧（客户端→服务端按规范必须掩码）。"""
+    if mask and not mask_key:
+        mask_key = os.urandom(4)
+    length = len(payload)
+    b0 = 0x80 | opcode
+    if length < 126:
+        b1 = length
+    elif length < 65536:
+        b1 = 126
+    else:
+        b1 = 127
+    if mask:
+        b1 |= 0x80
+    out = bytearray([b0, b1])
+    if 126 <= length < 65536:
+        out += struct.pack("!H", length)
+    elif length >= 65536:
+        out += struct.pack("!Q", length)
+    if mask:
+        out += mask_key
+        masked = bytearray(payload)
+        for i in range(length):
+            masked[i] ^= mask_key[i % 4]
+        payload = bytes(masked)
+    out += payload
+    return bytes(out)
+
+
+class WsFrameParser:
+    """流式帧解析器：feed 数据返回完整帧列表 [(fin, opcode, payload_bytes), ...]。"""
+
+    def __init__(self) -> None:
+        self._buf = b""
+
+    def feed(self, data: bytes) -> list:
+        self._buf += data
+        out = []
+        while True:
+            frame = self._try_frame()
+            if frame is None:
+                break
+            out.append(frame)
+        return out
+
+    def _try_frame(self):
+        if len(self._buf) < 2:
+            return None
+        b0, b1 = self._buf[0], self._buf[1]
+        fin = bool(b0 & 0x80)
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        length = b1 & 0x7F
+        pos = 2
+        if length == 126:
+            if len(self._buf) < 4:
+                return None
+            length = struct.unpack("!H", self._buf[2:4])[0]
+            pos = 4
+        elif length == 127:
+            if len(self._buf) < 10:
+                return None
+            length = struct.unpack("!Q", self._buf[2:10])[0]
+            pos = 10
+        mask = b""
+        if masked:
+            if len(self._buf) < pos + 4:
+                return None
+            mask = self._buf[pos : pos + 4]
+            pos += 4
+        if len(self._buf) < pos + length:
+            return None
+        payload = bytearray(self._buf[pos : pos + length])
+        if masked:
+            for i in range(length):
+                payload[i] ^= mask[i % 4]
+        self._buf = self._buf[pos + length :]
+        return (fin, opcode, bytes(payload))
+
+
+class WsClient:
+    """同步 WebSocket 客户端：connect() 完成握手，send_text / recv_frame 收发帧。"""
+
+    def __init__(self, url: str, timeout: float = 10.0, extra_headers: list = None) -> None:
+        u = urlsplit(url)
+        if u.scheme not in ("ws", "wss"):
+            raise ValueError("仅支持 ws:// 或 wss:// 地址")
+        self.url = url
+        self.timeout = timeout
+        self.extra_headers = extra_headers or []
+        self.secure = u.scheme == "wss"
+        self.host = u.hostname or ""
+        self.port = u.port or (443 if self.secure else 80)
+        self.path = (u.path or "/") + (("?" + u.query) if u.query else "")
+        self.sock = None
+        self._send_lock = threading.Lock()
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        if self.secure:
+            ctx = ssl.create_default_context()
+            raw = ctx.wrap_socket(raw, server_hostname=self.host)
+        self.sock = raw
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        lines = [
+            "GET %s HTTP/1.1" % self.path,
+            "Host: %s:%d" % (self.host, self.port),
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Key: " + key,
+            "Sec-WebSocket-Version: 13",
+        ]
+        for h in self.extra_headers:
+            lines.append(h)
+        raw.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+        resp = self._read_http_response()
+        status = -1
+        if resp.startswith("HTTP/"):
+            parts = resp.split(" ", 2)
+            try:
+                status = int(parts[1])
+            except Exception:
+                status = -1
+        if status != 101:
+            raise ConnectionError("WebSocket 握手失败：HTTP %s（%s）" % (status if status > 0 else "未知", resp[:160]))
+        expect = ws_accept_key(key)
+        got = self._parse_headers(resp).get("sec-websocket-accept", "")
+        if got != expect:
+            raise ConnectionError("WebSocket 握手校验失败：Sec-WebSocket-Accept 不匹配")
+
+    def _read_http_response(self) -> str:
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data.decode("latin-1")
+
+    def _parse_headers(self, resp: str) -> dict:
+        headers = {}
+        for line in resp.split("\r\n")[1:]:
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers[k.strip().lower()] = v.strip()
+        return headers
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("连接已断开")
+            buf += chunk
+        return buf
+
+    def recv_frame(self):
+        head = self._recv_exact(2)
+        b0, b1 = head[0], head[1]
+        opcode = b0 & 0x0F
+        length = b1 & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        mask = self._recv_exact(4) if (b1 & 0x80) else b""
+        payload = bytearray(self._recv_exact(length))
+        if mask:
+            for i in range(length):
+                payload[i] ^= mask[i % 4]
+        return opcode, bytes(payload)
+
+    def send_frame(self, opcode: int, payload: bytes) -> None:
+        with self._send_lock:
+            self.sock.sendall(ws_build_frame(opcode, payload, mask=True))
+
+    def send_text(self, text: str) -> None:
+        self.send_frame(0x1, text.encode("utf-8"))
+
+    def abort(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.send_frame(0x8, b"")
+        except Exception:
+            pass
+        self.abort()
+
+
+# --------------------------------------------------------------------------
+# SSE 解析（text/event-stream）与更新检查
+# --------------------------------------------------------------------------
+def parse_sse_lines(lines) -> list:
+    """按 SSE 规范把行序列解析为事件列表：[{'event': name, 'data': str}, ...]。"""
+    events = []
+    event_name = "message"
+    data_lines = []
+    for raw in lines:
+        if raw == "":
+            if data_lines:
+                events.append({"event": event_name, "data": "\n".join(data_lines)})
+            event_name = "message"
+            data_lines = []
+            continue
+        if raw.startswith(":"):
+            continue
+        if raw.startswith("event:"):
+            event_name = raw[len("event:") :].strip() or "message"
+        elif raw.startswith("data:"):
+            data_lines.append(raw[len("data:") :].lstrip())
+        # id: / retry: 行当前忽略
+    if data_lines:
+        events.append({"event": event_name, "data": "\n".join(data_lines)})
+    return events
+
+
+def version_tuple(v) -> tuple:
+    nums = re.findall(r"\d+", str(v))
+    tup = tuple(int(x) for x in nums[:4])
+    return tup + (0,) * (4 - len(tup))
+
+
+def version_compare(a, b) -> int:
+    """a < b → -1；a == b → 0；a > b → 1。支持 v 前缀与多段数字。"""
+    ta, tb = version_tuple(a), version_tuple(b)
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
+
+
+def check_for_update(timeout: float = 8.0, verify: bool = True) -> dict:
+    """请求 GitHub Releases API，返回最新版本与下载地址。网络失败时 ok=False。"""
+    try:
+        r = requests.get(
+            GITHUB_RELEASES_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": APP_NAME + "/" + CURRENT_VERSION,
+            },
+            timeout=timeout,
+            verify=verify,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": "GitHub API 返回 HTTP %d" % r.status_code, "current": CURRENT_VERSION}
+        data = r.json()
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "GitHub API 返回格式异常", "current": CURRENT_VERSION}
+        latest = str(data.get("tag_name") or data.get("name") or "").lstrip("vV")
+        return {
+            "ok": True,
+            "available": version_compare(latest, CURRENT_VERSION) > 0,
+            "latest": latest,
+            "current": CURRENT_VERSION,
+            "url": data.get("html_url") or GITHUB_REPO_URL,
+            "name": data.get("name") or "",
+            "body": (data.get("body") or "").strip()[:500],
+            "published_at": data.get("published_at") or "",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "current": CURRENT_VERSION}
 
 
 # --------------------------------------------------------------------------
@@ -1735,6 +2033,151 @@ class HttpWorker(QThread):
 
 
 # --------------------------------------------------------------------------
+# WebSocket / SSE / 更新检查 工作线程
+# --------------------------------------------------------------------------
+class WsWorker(QThread):
+    connected = Signal(str)
+    message = Signal(str, str)  # text, direction(in/out)
+    error = Signal(str)
+    closed = Signal(str)
+    finished_conn = Signal()
+
+    def __init__(self, url: str, timeout: float = 10.0, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.timeout = timeout
+        self._stop = False
+        self._client: "WsClient | None" = None
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._client is not None:
+            self._client.abort()
+
+    def run(self) -> None:  # noqa: D102
+        client = None
+        try:
+            client = WsClient(self.url, self.timeout)
+            client.connect()
+            self._client = client
+            self.connected.emit(self.url)
+            while not self._stop:
+                opcode, payload = client.recv_frame()
+                if opcode == 0x8:
+                    self.closed.emit("连接已关闭（收到 close 帧）")
+                    break
+                elif opcode == 0x9:
+                    client.send_frame(0xA, payload)
+                elif opcode == 0xA:
+                    continue
+                elif opcode == 0x1:
+                    try:
+                        text = payload.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = repr(payload)
+                    self.message.emit(text, "in")
+                elif opcode == 0x2:
+                    self.message.emit("[二进制 %d 字节] %s" % (len(payload), repr(payload[:160])), "in")
+                else:
+                    self.message.emit("[未知帧 opcode=%d len=%d]" % (opcode, len(payload)), "in")
+        except Exception as e:  # noqa: BLE001
+            if not self._stop:
+                self.error.emit(str(e))
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self._client = None
+            self.finished_conn.emit()
+
+
+class SseWorker(QThread):
+    connected = Signal(str)
+    event = Signal(str, str)  # event_name, data
+    error = Signal(str)
+    closed = Signal(str)
+    finished_conn = Signal()
+
+    def __init__(self, url: str, timeout: float = 15.0, verify: bool = False, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.timeout = timeout
+        self.verify = verify
+        self._stop = False
+        self._resp = None
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._resp is not None:
+            try:
+                self._resp.close()
+            except Exception:
+                pass
+
+    def run(self) -> None:  # noqa: D102
+        resp = None
+        try:
+            resp = requests.get(
+                self.url,
+                stream=True,
+                timeout=(max(5.0, self.timeout), self.timeout),
+                verify=self.verify,
+            )
+            self._resp = resp
+            if resp.status_code != 200:
+                self.error.emit("SSE 连接失败：HTTP %d" % resp.status_code)
+                return
+            self.connected.emit(self.url)
+            event_name = "message"
+            data_lines = []
+            for raw in resp.iter_lines(decode_unicode=True):
+                if self._stop:
+                    break
+                if raw is None:
+                    continue
+                if raw == "":
+                    if data_lines:
+                        self.event.emit(event_name, "\n".join(data_lines))
+                    event_name = "message"
+                    data_lines = []
+                    continue
+                if raw.startswith(":"):
+                    continue
+                if raw.startswith("event:"):
+                    event_name = raw[len("event:") :].strip() or "message"
+                elif raw.startswith("data:"):
+                    data_lines.append(raw[len("data:") :].lstrip())
+                # id: / retry: 行当前忽略
+            if data_lines:
+                self.event.emit(event_name, "\n".join(data_lines))
+        except Exception as e:  # noqa: BLE001
+            if not self._stop:
+                self.error.emit(str(e))
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            self._resp = None
+            self.finished_conn.emit()
+
+
+class CheckUpdateWorker(QThread):
+    done = Signal(dict)
+
+    def __init__(self, timeout: float = 8.0, verify: bool = True, parent=None):
+        super().__init__(parent)
+        self.timeout = timeout
+        self.verify = verify
+
+    def run(self) -> None:  # noqa: D102
+        self.done.emit(check_for_update(self.timeout, self.verify))
+
+
+# --------------------------------------------------------------------------
 # 集合运行器
 # --------------------------------------------------------------------------
 def build_payload_from_snapshot(req: dict, variables: dict, timeout: int, verify: bool, allow_redirects: bool) -> dict:
@@ -2162,6 +2605,247 @@ THEME_COLORS = {
         "chip_err_fg": "#d93025",
     },
 }
+
+
+# --------------------------------------------------------------------------
+# WebSocket / SSE 面板（独立入口：实时收发消息、连接状态、断开重连）
+# --------------------------------------------------------------------------
+class WsSsePanel(QWidget):
+    def __init__(self, main, parent=None):
+        super().__init__(parent)
+        self._main = main
+        self._theme = main.current_theme()
+        self._worker = None
+        self._connected = False
+        self._msg_count = 0
+        self._build_ui()
+        self.set_theme(self._theme)
+
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(QLabel("类型："))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["WebSocket", "SSE"])
+        self.type_combo.setFixedWidth(120)
+        row.addWidget(self.type_combo)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("WebSocket: ws:// 或 wss:// …   SSE: http:// 或 https:// 事件流地址")
+        self.url_edit.returnPressed.connect(self._toggle_connect)
+        row.addWidget(self.url_edit, 1)
+        self.conn_btn = QPushButton("连接")
+        self.conn_btn.setObjectName("primary")
+        self.conn_btn.setFixedWidth(96)
+        self.conn_btn.clicked.connect(self._toggle_connect)
+        row.addWidget(self.conn_btn)
+        self.clear_btn = QPushButton("清空消息")
+        self.clear_btn.clicked.connect(self._clear_log)
+        row.addWidget(self.clear_btn)
+        root.addLayout(row)
+
+        srow = QHBoxLayout()
+        srow.setSpacing(6)
+        self.status_label = QLabel("未连接")
+        srow.addWidget(self.status_label)
+        self.count_label = QLabel("消息：0")
+        srow.addWidget(self.count_label)
+        self.hint_label = QLabel("WebSocket 可发送文本消息并实时回显；SSE 为单向事件流订阅")
+        srow.addWidget(self.hint_label, 1)
+        root.addLayout(srow)
+
+        self.log_edit = QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        root.addWidget(self.log_edit, 1)
+
+        mrow = QHBoxLayout()
+        mrow.setSpacing(6)
+        self.msg_edit = QLineEdit()
+        self.msg_edit.setPlaceholderText("输入要发送的文本消息（仅 WebSocket 支持）")
+        self.msg_edit.returnPressed.connect(self._send_message)
+        mrow.addWidget(self.msg_edit, 1)
+        self.send_btn = QPushButton("发送消息")
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self._send_message)
+        mrow.addWidget(self.send_btn)
+        self.disc_btn = QPushButton("断开")
+        self.disc_btn.setEnabled(False)
+        self.disc_btn.clicked.connect(self._disconnect)
+        mrow.addWidget(self.disc_btn)
+        root.addLayout(mrow)
+
+        self._set_status("未连接", "default")
+
+    # ------------------------------------------------------------------
+    # 主题与状态
+    # ------------------------------------------------------------------
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme if theme in THEME_COLORS else "dark"
+        if hasattr(self, "hint_label") and self.hint_label is not None:
+            self.hint_label.setStyleSheet(self._hint_style())
+        if hasattr(self, "status_label"):
+            self._refresh_status_chip()
+
+    def _hint_style(self) -> str:
+        return f"color:{THEME_COLORS[self._theme]['hint']};"
+
+    def _refresh_status_chip(self) -> None:
+        c = THEME_COLORS[self._theme]
+        kind = getattr(self, "_status_kind", "default")
+        bg = c.get("chip_" + kind + "_bg", c["chip_default_bg"])
+        fg = c.get("chip_" + kind + "_fg", c["chip_default_fg"])
+        self.status_label.setStyleSheet(
+            f"background:{bg}; color:{fg}; border-radius:9px; padding:2px 10px; font-weight:600;"
+        )
+
+    def _set_status(self, text: str, kind: str = "default") -> None:
+        self._status_kind = kind
+        self.status_label.setText(text)
+        self._refresh_status_chip()
+
+    def _append(self, direction: str, text: str, color: str = None) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        tag = "发送" if direction == "out" else "接收"
+        prefix = f"[{ts}] [{tag}] "
+        if color is None:
+            color = "#3ecf8e" if direction == "out" else "#5aa9f0"
+        self.log_edit.appendHtml(
+            f'<span style="color:{color};">{html.escape(prefix)}</span>{html.escape(text)}'
+        )
+        self._msg_count += 1
+        self.count_label.setText(f"消息：{self._msg_count}")
+
+    def _clear_log(self) -> None:
+        self.log_edit.clear()
+        self._msg_count = 0
+        self.count_label.setText("消息：0")
+
+    # ------------------------------------------------------------------
+    # 连接控制
+    # ------------------------------------------------------------------
+    def _toggle_connect(self) -> None:
+        if self._connected:
+            self._disconnect()
+            return
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.information(self, "提示", "请输入连接地址。")
+            return
+        if self.type_combo.currentIndex() == 0:
+            if not (url.startswith("ws://") or url.startswith("wss://")):
+                QMessageBox.warning(self, "地址格式", "WebSocket 地址需以 ws:// 或 wss:// 开头。")
+                return
+            self._connect_ws(url)
+        else:
+            if not (url.startswith("http://") or url.startswith("https://")):
+                QMessageBox.warning(self, "地址格式", "SSE 地址需以 http:// 或 https:// 开头。")
+                return
+            self._connect_sse(url)
+
+    def _connect_ws(self, url: str) -> None:
+        self._set_status("连接中…", "busy")
+        self.conn_btn.setEnabled(False)
+        self._worker = WsWorker(url, parent=self)
+        self._worker.connected.connect(lambda u: self._on_connected("WebSocket", u))
+        self._worker.message.connect(self._on_ws_msg)
+        self._worker.error.connect(self._on_error)
+        self._worker.closed.connect(self._on_closed)
+        self._worker.finished_conn.connect(self._on_finished)
+        self._worker.start()
+
+    def _connect_sse(self, url: str) -> None:
+        self._set_status("连接中…", "busy")
+        self.conn_btn.setEnabled(False)
+        self._worker = SseWorker(url, parent=self)
+        self._worker.connected.connect(lambda u: self._on_connected("SSE", u))
+        self._worker.event.connect(self._on_sse_event)
+        self._worker.error.connect(self._on_error)
+        self._worker.closed.connect(self._on_closed)
+        self._worker.finished_conn.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_connected(self, kind: str, url: str) -> None:
+        self._connected = True
+        self._set_status(f"已连接 · {kind}", "busy")
+        self.conn_btn.setEnabled(True)
+        self.conn_btn.setText("重连")
+        self.send_btn.setEnabled(self.type_combo.currentIndex() == 0)
+        self.disc_btn.setEnabled(True)
+        self._append("in", f"连接成功：{url}")
+
+    def _on_ws_msg(self, text: str, direction: str) -> None:
+        self._append("out" if direction == "out" else "in", text)
+
+    def _on_sse_event(self, event_name: str, data: str) -> None:
+        self._append("in", f"event: {event_name}\ndata: {data}")
+
+    def _send_message(self) -> None:
+        if not self._connected:
+            return
+        if self.type_combo.currentIndex() != 0:
+            QMessageBox.information(self, "提示", "SSE 为单向订阅，不支持发送消息。")
+            return
+        text = self.msg_edit.text()
+        if not text.strip():
+            return
+        w = self._worker
+        if isinstance(w, WsWorker) and w._client is not None:
+            try:
+                w._client.send_text(text)
+                self._append("out", text)
+                self.msg_edit.clear()
+            except Exception as e:  # noqa: BLE001
+                self._append("in", "[发送失败] " + str(e), "#f05f5f")
+
+    def _disconnect(self) -> None:
+        self._set_status("断开中…", "busy")
+        w = self._worker
+        if w is not None:
+            if isinstance(w, WsWorker):
+                w.stop()
+            elif isinstance(w, SseWorker):
+                w.stop()
+        self._connected = False
+        self.send_btn.setEnabled(False)
+        self.disc_btn.setEnabled(False)
+        self.conn_btn.setText("连接")
+        self._set_status("未连接", "default")
+
+    def _on_error(self, message: str) -> None:
+        self._append("in", "[错误] " + str(message), "#f05f5f")
+        self._set_status("连接失败", "err")
+
+    def _on_closed(self, message: str) -> None:
+        self._append("in", "[关闭] " + str(message), "#f0a45d")
+        self._set_status("已断开", "default")
+
+    def _on_finished(self) -> None:
+        if self._connected:
+            self._connected = False
+            self.send_btn.setEnabled(False)
+            self.disc_btn.setEnabled(False)
+            self.conn_btn.setText("重连")
+        else:
+            self.conn_btn.setEnabled(True)
+            if self.conn_btn.text() != "重连":
+                self.conn_btn.setText("连接")
+
+    def closeEvent(self, event) -> None:  # noqa: D102
+        w = self._worker
+        if w is not None and w.isRunning():
+            if isinstance(w, WsWorker):
+                w.stop()
+            elif isinstance(w, SseWorker):
+                w.stop()
+            w.wait(2000)
+        super().closeEvent(event)
 
 
 # --------------------------------------------------------------------------
@@ -3452,6 +4136,14 @@ class MainWindow(QMainWindow):
         self._rebuild_collections()
         self._new_request_tab()
         self.status_msg("就绪。数据目录：" + DATA_DIR)
+        # 启动静默检查更新（延迟 3 秒，避免影响首屏渲染；可通过勾选关闭）
+        # 自检 / 截图模式不注册定时器，避免离屏退出时网络线程未回收导致崩溃
+        if (
+            self.check_upd_chk.isChecked()
+            and "--self-test" not in sys.argv
+            and "--ui-shot" not in sys.argv
+        ):
+            QTimer.singleShot(3000, self._startup_check_update)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -3485,6 +4177,13 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setRange(1, 600)
         self.timeout_spin.setValue(30)
         opts.addWidget(self.timeout_spin)
+        opts.addSpacing(10)
+        self.check_upd_chk = QCheckBox("启动时检查更新")
+        self.check_upd_chk.setChecked(True)
+        opts.addWidget(self.check_upd_chk)
+        self.check_upd_btn = QPushButton("检查更新")
+        self.check_upd_btn.clicked.connect(self.check_for_update_manual)
+        opts.addWidget(self.check_upd_btn)
         self.var_hint = QLabel("")
         self.var_hint.setStyleSheet(self._hint_style())
         opts.addWidget(self.var_hint, 1)
@@ -3516,6 +4215,7 @@ class MainWindow(QMainWindow):
         root.addWidget(main_split, 1)
 
         left = QTabWidget()
+        self.left_tabs = left
         hist_wrap = QWidget()
         hv = QVBoxLayout(hist_wrap)
         hv.setContentsMargins(6, 6, 6, 6)
@@ -3573,6 +4273,10 @@ class MainWindow(QMainWindow):
         cv.addWidget(self.coll_tree, 1)
         left.addTab(coll_wrap, "集合")
 
+        # WebSocket / SSE 独立面板（第三个左侧标签）
+        self.ws_panel = WsSsePanel(self)
+        left.addTab(self.ws_panel, "WebSocket / SSE")
+
         self.request_tabs = QTabWidget()
         self.request_tabs.setTabsClosable(True)
         self.request_tabs.tabCloseRequested.connect(self._close_request_tab)
@@ -3616,6 +4320,8 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(THEMES[self._theme])
         for tab in self._tabs:
             tab.set_theme(self._theme)
+        if hasattr(self, "ws_panel") and self.ws_panel is not None:
+            self.ws_panel.set_theme(self._theme)
         self._update_var_hint()
 
     # ------------------------------------------------------------------
@@ -3681,6 +4387,7 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(int(s.get("timeout", 30)))
         self.verify_chk.setChecked(not bool(s.get("verify", True)))
         self.redirect_chk.setChecked(bool(s.get("follow_redirects", True)))
+        self.check_upd_chk.setChecked(bool(s.get("check_update_on_start", True)))
         theme = s.get("theme", "dark")
         self._theme = theme if theme in THEMES else "dark"
         self.theme_combo.blockSignals(True)
@@ -3694,12 +4401,64 @@ class MainWindow(QMainWindow):
         s["verify"] = not self.verify_chk.isChecked()
         s["follow_redirects"] = self.redirect_chk.isChecked()
         s["theme"] = self._theme
+        s["check_update_on_start"] = self.check_upd_chk.isChecked()
 
     def _persist(self) -> None:
         save_state(self.state)
 
     def status_msg(self, text: str, timeout: int = 5000) -> None:
         self.statusBar().showMessage(text, timeout)
+
+    # ------------------------------------------------------------------
+    # 内置更新检查
+    # ------------------------------------------------------------------
+    def check_for_update_manual(self) -> None:
+        if hasattr(self, "_update_worker") and self._update_worker is not None and self._update_worker.isRunning():
+            self.status_msg("正在检查更新中，请稍候…")
+            return
+        self.check_upd_btn.setEnabled(False)
+        self.check_upd_btn.setText("检查中…")
+        self.status_msg("正在检查更新…")
+        self._run_check_update(manual=True)
+
+    def _startup_check_update(self) -> None:
+        if not self.check_upd_chk.isChecked():
+            return
+        self._run_check_update(manual=False)
+
+    def _run_check_update(self, manual: bool) -> None:
+        self._update_worker = CheckUpdateWorker(parent=self)
+        self._update_worker.done.connect(lambda info: self._on_update_result(info, manual))
+        self._update_worker.start()
+
+    def _on_update_result(self, info: dict, manual: bool) -> None:
+        self.check_upd_btn.setEnabled(True)
+        self.check_upd_btn.setText("检查更新")
+        if not info.get("ok"):
+            err = info.get("error") or "网络不可达"
+            if manual:
+                QMessageBox.information(
+                    self, "检查更新",
+                    f"检查更新失败：{err}\n当前版本：{CURRENT_VERSION}",
+                )
+            else:
+                self.status_msg("更新检查失败（可在「检查更新」按钮手动重试）")
+            return
+        if info.get("available"):
+            QMessageBox.information(
+                self, "发现新版本",
+                (
+                    f"当前版本：{CURRENT_VERSION}\n"
+                    f"最新版本：{info.get('latest')}\n"
+                    f"发布时间：{info.get('published_at') or '未知'}\n\n"
+                    f"更新说明：\n{info.get('body') or '（无说明）'}\n\n"
+                    f"下载地址：\n{info.get('url') or GITHUB_REPO_URL}"
+                ),
+            )
+        elif manual:
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本：{CURRENT_VERSION}")
+        else:
+            self.status_msg(f"已是最新版本：{CURRENT_VERSION}")
 
     # ------------------------------------------------------------------
     # 环境
@@ -4493,6 +5252,27 @@ def run_self_test() -> None:
         ok = False
         lines.append("ui smoke error: " + repr(e))
 
+    # WebSocket / SSE / 更新检查 功能自检（本地回环，不依赖外网）
+    try:
+        ws_ok = ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        frame = ws_build_frame(0x1, b"selftest", mask=True)
+        parser = WsFrameParser()
+        parsed = parser.feed(frame)
+        frame_ok = len(parsed) == 1 and parsed[0][2] == b"selftest"
+        sse_ok = parse_sse_lines("event: e\ndata: d\n\n".splitlines()) == [{"event": "e", "data": "d"}]
+        ver_ok = version_compare("1.6.1", "1.6.0") > 0 and version_compare("v1.6.0", "1.6.0") == 0
+        upd_panel_ok = hasattr(win, "ws_panel") and win.left_tabs.count() == 3
+        upd_btn_ok = hasattr(win, "check_upd_btn") and win.check_upd_btn.text() == "检查更新"
+        ws_new = ws_ok and frame_ok and sse_ok and ver_ok and upd_panel_ok and upd_btn_ok
+        ok = ok and ws_new
+        lines.append(
+            f"ws/sse/update: accept={ws_ok} frame={frame_ok} sse={sse_ok} version={ver_ok} "
+            f"ws_panel={upd_panel_ok} upd_btn={upd_btn_ok}"
+        )
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        lines.append("ws/sse/update error: " + repr(e))
+
     lines.append("frozen: " + str(getattr(sys, "frozen", False)))
     lines.append("data_dir: " + DATA_DIR)
     lines.append("requests: " + getattr(requests, "__version__", "?"))
@@ -4705,6 +5485,22 @@ def run_ui_shot(out_dir: str, theme_name: str = None) -> None:
                     runner_dlg._runner.wait(6000)
             except Exception as e:  # noqa: BLE001
                 lines.append(f"[{theme}] runner error: {repr(e)}")
+            # WebSocket / SSE 面板视图（不触发真实连接）
+            try:
+                ws_panel = win.ws_panel
+                win.left_tabs.setCurrentWidget(ws_panel)
+                ws_panel.type_combo.setCurrentText("WebSocket")
+                ws_panel.url_edit.setText("wss://echo.websocket.org/")
+                qapp.processEvents()
+                saved = win.grab().save(os.path.join(out_dir, f"{theme}_ws.png"))
+                ws_panel.type_combo.setCurrentText("SSE")
+                ws_panel.url_edit.setText("https://api.example.com/events")
+                qapp.processEvents()
+                saved2 = win.grab().save(os.path.join(out_dir, f"{theme}_sse.png"))
+                lines.append(f"[{theme}] ws saved={saved} type={ws_panel.type_combo.currentText()} url={ws_panel.url_edit.text()}")
+                lines.append(f"[{theme}] sse saved={saved2} state={ws_panel.status_label.text()}")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"[{theme}] ws/sse error: {repr(e)}")
             win.close()
     except Exception as e:  # noqa: BLE001
         lines.append("ui-shot error: " + repr(e))
